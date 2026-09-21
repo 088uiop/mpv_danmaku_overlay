@@ -458,7 +458,6 @@ void IpcServer::handle_message(const IpcMessage& msg) {
         break;
 
     case IpcMessageType::Shutdown:
-        DANMAKU_LOG_INFO(LOG_TAG, "收到 shutdown 命令");
         running_.store(false, std::memory_order_release);
         break;
 

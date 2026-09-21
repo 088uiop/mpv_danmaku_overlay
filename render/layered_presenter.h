@@ -26,7 +26,15 @@ public:
 
     HWND get_hwnd() const { return hwnd_; }
 
-    void set_mpv_hwnd(HWND hwnd) { mpv_hwnd_ = hwnd; }
+    void set_mpv_hwnd(HWND hwnd) {
+        mpv_hwnd_ = hwnd;
+        if (hwnd_ && hwnd && IsWindow(hwnd)) {
+            SetWindowLongPtrW(hwnd_, GWLP_HWNDPARENT,
+                              reinterpret_cast<LONG_PTR>(hwnd));
+            SetWindowPos(hwnd_, hwnd, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
     HWND get_mpv_hwnd() const { return mpv_hwnd_; }
 
     // 来自 IPC 的废弃消息, 仅保留协议兼容 (实际几何由 sync_to_mpv_window 轮询)

@@ -207,6 +207,16 @@ static HWND find_mpv_hwnd(uint32_t pid) {
     return nullptr;
 }
 
+// 判断 pid 进程是否仍在运行 (进程存活时 WAIT_TIMEOUT)
+static bool process_alive(uint32_t pid) {
+    if (pid == 0) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return false;
+    DWORD wait = WaitForSingleObject(h, 0);
+    CloseHandle(h);
+    return wait == WAIT_TIMEOUT;
+}
+
 static CmdArgs parse_args(LPWSTR cmd_line) {
     CmdArgs args;
 
@@ -255,25 +265,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     auto& logger = danmaku_overlay::Logger::instance();
     logger.set_level(danmaku_overlay::LogLevel::Info);
 
-    // 初始化 COM (Direct2D/DirectWrite 需要)
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr)) {
-        DANMAKU_LOG_FATAL(LOG_TAG, "COM 初始化失败 (0x%08X)",
-                          static_cast<unsigned int>(hr));
-        return 1;
-    }
-
-    // DPI 感知 (Per-Monitor V2)
-    danmaku_overlay::platform::SetDpiAwareness();
-
-    // 提升系统定时器分辨率到 1ms。
-    // ⚠ 关键: Windows 默认定时器粒度约 15.6ms, 不加这行的话 Sleep(n) 实际会
-    //   睡到 15.6ms 的整数倍, 对 60fps (16.67ms/帧) 的节奏控制是灾难 — 帧间隔
-    //   会在 15.6 / 31.2ms 之间跳, 表现为弹幕"快一下慢一下"的卡顿。
-    //   必须在渲染循环开始前调用, 退出时 timeEndPeriod 还原。
-    timeBeginPeriod(1);
-    DANMAKU_LOG_INFO(LOG_TAG, "系统定时器分辨率已提升为 1ms");
-
     // 解析命令行参数
     CmdArgs args = parse_args(lpCmdLine);
 
@@ -282,10 +273,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         const wchar_t* log_path = args.log_path[0] ? args.log_path : nullptr;
         char log_path_a[512] = {};
         if (!log_path) {
-            // 默认: %TEMP%/danmaku_overlay.log
+            // 默认: %TEMP%/danmaku_overlay_YYMMDD.log (每天一个文件)
             wchar_t temp_dir[MAX_PATH];
             GetTempPathW(MAX_PATH, temp_dir);
-            swprintf_s(args.log_path, 512, L"%lsdanmaku_overlay.log", temp_dir);
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            swprintf_s(args.log_path, 512,
+                       L"%lsdanmaku_overlay_%02d%02d%02d.log",
+                       temp_dir, st.wYear % 100, st.wMonth, st.wDay);
             log_path = args.log_path;
         }
         WideCharToMultiByte(CP_UTF8, 0, log_path, -1,
@@ -298,6 +293,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         CoUninitialize();
         return 1;
     }
+
+    // 初始化 COM (Direct2D/DirectWrite 需要)
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) {
+        DANMAKU_LOG_FATAL(LOG_TAG, "COM 初始化失败 (0x%08X)",
+                          static_cast<unsigned int>(hr));
+        return 1;
+    }
+
+    // DPI 感知 (Per-Monitor V2)
+    danmaku_overlay::platform::SetDpiAwareness();
+
+    // 提升系统定时器分辨率到 1ms。
+    timeBeginPeriod(1);
 
     // 默认管道名 (基于 PID)
     wchar_t default_pipe[256];
@@ -426,10 +435,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             break;
         }
 
-        // 检查绑定的 mpv 窗口是否还存在 —— 窗口被销毁即退出主循环
         if (!IsWindow(args.mpv_hwnd)) {
-            DANMAKU_LOG_INFO(LOG_TAG, "mpv 窗口已关闭, 退出");
-            break;
+            // 窗口句柄失效: 先用 PID 找回 mpv 重建的新窗口
+            HWND new_hwnd = find_mpv_hwnd(args.mpv_pid);
+            if (new_hwnd && new_hwnd != args.mpv_hwnd) {
+                DANMAKU_LOG_INFO(LOG_TAG,
+                    "mpv 窗口已重建, 重新绑定: 0x%p -> 0x%p",
+                    args.mpv_hwnd, new_hwnd);
+                args.mpv_hwnd = new_hwnd;
+                window.set_mpv_hwnd(new_hwnd);  // 同步 owner 并抬回 mpv 上方
+                continue;
+            }
+            if (args.mpv_pid && !process_alive(args.mpv_pid)) {
+                DANMAKU_LOG_INFO(LOG_TAG,
+                    "mpv 进程已退出 (pid=%u), 结束主循环", args.mpv_pid);
+                break;
+            }
         }
 
         // 收到 IPC shutdown 命令 (IpcServer 内部标志)
