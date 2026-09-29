@@ -93,6 +93,12 @@ private:
     DanmakuEngine*      engine_           = nullptr;
     WindowManager*      window_           = nullptr;
 
+    // 监听线程的 Win32 线程 ID (由监听线程自身写入当前线程 ID):
+    // shutdown() 用它通过 OpenThread + CancelSynchronousIo 中断阻塞在
+    // ConnectNamedPipe 上的同步等待, 否则 mpv 消失路径下 (lua 客户端已死,
+    // 无人来连接) 监听线程将永久阻塞, listen_thread_.join() 卡死。
+    std::atomic<DWORD>  listen_thread_id_{0};
+
     std::thread         listen_thread_;
     std::thread         read_thread_;
     std::atomic<bool>   running_{false};

@@ -216,18 +216,23 @@ void IpcServer::shutdown() {
     // (否则 "IpcServer 已关闭" 会被打印两次)。
     if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) return;
 
-    // 即使 running_ 已被 IPC shutdown 提前置 false, 也必须完整清理
-    // (关闭管道 + join 线程), 否则监听/读取线程泄漏, 进程可能卡在
-    // ConnectNamedPipe 形成僵尸。joinable()/INVALID 句柄守卫保证重复调用安全。
     running_.store(false, std::memory_order_release);
 
-    if (pipe_handle_ != INVALID_HANDLE_VALUE) {
-        FlushFileBuffers(pipe_handle_);
-        DisconnectNamedPipe(pipe_handle_);
-        CloseHandle(pipe_handle_);
-        pipe_handle_ = INVALID_HANDLE_VALUE;
+    DWORD listen_tid = listen_thread_id_.load(std::memory_order_acquire);
+    if (listen_tid != 0) {
+        HANDLE thread_handle = OpenThread(SYNCHRONIZE | THREAD_TERMINATE, FALSE, listen_tid);
+        if (thread_handle) {
+            for (int i = 0; i < 50; ++i) {
+                if (WaitForSingleObject(thread_handle, 0) == WAIT_OBJECT_0) break;
+                CancelSynchronousIo(thread_handle);
+                Sleep(1);
+            }
+            CloseHandle(thread_handle);
+        }
     }
 
+    // 管道句柄的创建与关闭完全由监听线程管理 (谁创建谁关闭),
+    // 这里不再跨线程关闭 pipe_handle_, 消除句柄竞争与两次关闭的风险。
     client_connected_.store(false, std::memory_order_release);
 
     if (listen_thread_.joinable()) listen_thread_.join();
@@ -238,6 +243,8 @@ void IpcServer::shutdown() {
 
 // 监听线程: 创建命名管道并等待连接
 void IpcServer::listen_thread_main() {
+    listen_thread_id_.store(GetCurrentThreadId(), std::memory_order_release);
+
     DANMAKU_LOG_INFO(LOG_TAG, "IPC 监听线程启动");
 
     while (running_.load(std::memory_order_acquire)) {
@@ -260,6 +267,10 @@ void IpcServer::listen_thread_main() {
             DWORD err = GetLastError();
             if (err == ERROR_PIPE_CONNECTED) {
                 connected = TRUE;
+            } else if (err == ERROR_OPERATION_ABORTED) {
+                CloseHandle(pipe_handle_);
+                pipe_handle_ = INVALID_HANDLE_VALUE;
+                break;
             } else if (err == ERROR_PIPE_LISTENING) {
                 continue;
             } else {
