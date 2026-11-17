@@ -480,6 +480,13 @@ ErrorCode DanmakuEngine::initialize(HWND overlay_hwnd,
             nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     }
 
+    {
+        const char* p = std::getenv("DANMAKU_PACING");
+        pace_compositor_ = !(p && std::string(p) == "timer");
+        DANMAKU_LOG_INFO(LOG_TAG, "帧节拍: %s",
+                         pace_compositor_ ? "DWM 合成器时钟" : "QPC 定时器");
+    }
+
     initialized_ = true;
     DANMAKU_LOG_INFO(LOG_TAG, "DanmakuEngine 初始化完成 (layered ghost window)");
     return ErrorCode::Ok;
@@ -659,8 +666,14 @@ void DanmakuEngine::set_delay(double seconds) {
 // ============================================================
 
 bool DanmakuEngine::render() {
-    std::lock_guard<std::mutex> lock(engine_mutex_);
+std::lock_guard<std::mutex> lock(engine_mutex_);
     if (!initialized_ || !presenter_.context()) return false;
+
+    presenter_.diag_tick_render();
+    LARGE_INTEGER diag_t_engine{};
+    if (presenter_.diag_active()) QueryPerformanceCounter(&diag_t_engine);
+    presenter_.diag_flush_if_due(static_cast<uint32_t>(active_events_.size()),
+                                  frame_interval_ > 0.0 ? 1.0 / frame_interval_ : 0.0);
 
     // 处理主线程发来的尺寸变更请求 (实际重建只在渲染线程执行)
     if (resize_pending_.exchange(false, std::memory_order_acq_rel)) {
@@ -703,6 +716,19 @@ bool DanmakuEngine::render() {
     TimePos time_pos = clock_now();
     current_time_    = time_pos;
 
+    // 位置取"预计上屏时刻"的媒体时间, 而不是此刻: 渲染线程调度/Present 的抖动
+    // 不再变成弹幕位置抖动。仅在时钟走动时生效 (暂停时冻结)。
+    if (pace_compositor_ && clock_valid_ && !clock_paused_) {
+        LONGLONG tq = 0;
+        if (presenter_.predict_next_frame_qpc(tq)) {
+            const double el = static_cast<double>(tq - clock_base_qpc_.QuadPart)
+                            / static_cast<double>(qpc_freq_.QuadPart);
+            const TimePos predicted = clock_base_time_ + el * clock_speed_ - delay_;
+            if (predicted >= time_pos && predicted - time_pos < 0.1)
+                current_time_ = predicted;
+        }
+    }
+
     // --- 1. 激活新弹幕 ---
     while (seek_cursor_ < ass_doc_.events.size()) {
         AssEvent& ev = ass_doc_.events[seek_cursor_];
@@ -744,6 +770,7 @@ bool DanmakuEngine::render() {
             return false;
         }
     }
+    if (presenter_.diag_active()) presenter_.diag_add_phase(4, diag_t_engine);
     presenter_.begin_frame();
 
     // SDR: 直画 swap chain; HDR: 画进离屏 FP16 coverage 缓冲 (合成 pass 统一乘峰值)。
@@ -770,6 +797,8 @@ bool DanmakuEngine::render() {
         ? 1.0f
         : static_cast<float>(presenter_.height()) / static_cast<float>(ass_doc_.play_res_y);
 
+    LARGE_INTEGER diag_t_ev{};
+    if (presenter_.diag_active()) QueryPerformanceCounter(&diag_t_ev);
     for (auto* ev : active_events_) {
         if (!ev->active) continue;
 
@@ -908,6 +937,7 @@ bool DanmakuEngine::render() {
                             text_brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
 
+    if (presenter_.diag_active()) presenter_.diag_add_phase(5, diag_t_ev);
     HRESULT hr = presenter_.end_frame();
     if (hr == static_cast<HRESULT>(D2DERR_RECREATE_TARGET)) {
         DANMAKU_LOG_WARN(LOG_TAG, "D2D 需要重建目标");
@@ -960,6 +990,23 @@ void DanmakuEngine::shutdown() {
 
 void DanmakuEngine::wait_for_next_frame() {
     if (qpc_freq_.QuadPart == 0) return;
+
+    // 优先对齐 DWM 合成 tick。target_fps 低于刷新率时按整数倍抽帧
+    // (如 144Hz/60fps -> 每 2 个 tick 画一次), 保证节奏均匀。
+    if (pace_compositor_) {
+        const double target = frame_interval_ > 0.0 ? 1.0 / frame_interval_ : 60.0;
+        int n = static_cast<int>(presenter_.compositor_rate_hz() / target + 0.15);
+        if (n < 1) n = 1;
+        if (n > 8) n = 8;
+        bool ok = true;
+        for (int i = 0; i < n && ok; ++i) ok = presenter_.wait_compositor_tick(50);
+        if (ok) { pace_fail_streak_ = 0; frame_qpc_.QuadPart = 0; return; }
+        if (++pace_fail_streak_ >= 5) {
+            pace_compositor_ = false;
+            DANMAKU_LOG_WARN(LOG_TAG, "等待合成器 tick 连续失败, 退回 QPC 定时器节拍");
+        }
+        // 本帧退回定时器路径 (下面)
+    }
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);

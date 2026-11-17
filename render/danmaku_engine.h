@@ -138,8 +138,15 @@ public:
     void set_hdr_enabled(bool enabled);
     void set_hdr_peak(float peak);
 
-    uint32_t get_active_count() const;
+uint32_t get_active_count() const;
     RenderConfig get_config() const;
+
+    // 前台满载播放器抢 GPU 时的自适应让出: 注册目标进程 (mpv 的 pid)。
+    //   详见 LayeredPresenter::set_gpu_yield_pid 与 layered_presenter.cpp。
+    void set_mpv_gpu_pid(uint32_t pid) { presenter_.set_gpu_yield_pid(pid); }
+
+    // 空闲帧通知 (未绘制时调用): 推进让出/恢复的统计窗口
+    void notify_idle_frame() { presenter_.gpu_yield_idle_frame(); }
 
 private:
     double clock_now() const;                                // 当前媒体时间
@@ -177,6 +184,8 @@ private:
     LARGE_INTEGER       frame_qpc_{};
     double              frame_interval_ = 1.0 / 60.0;
     HANDLE              frame_timer_ = nullptr;   // 高分辨率帧节拍定时器 (可空)
+    bool                pace_compositor_ = true;  // 对齐 DWM 合成 tick (DANMAKU_PACING=timer 关闭)
+    uint32_t            pace_fail_streak_ = 0;    // 连续等 tick 失败次数, 超限退回定时器
 
     // 线程安全: IPC 线程写 sync/set_*/load/clear/apply/get; 渲染线程持锁整帧渲染
     mutable std::mutex      engine_mutex_;

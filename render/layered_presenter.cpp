@@ -293,8 +293,8 @@ ErrorCode WindowManager::create(HINSTANCE hInstance, uint32_t width,
     //       合成器窗口同款组合)
     //   WS_EX_TOOLWINDOW     - 不出现在任务栏 / Alt-Tab
     //   WS_EX_NOACTIVATE     - 点击不激活、不抢焦点
-    //   ⚠ 不加 WS_EX_TOPMOST — owned window 已保证在 mpv 之上,
-    //     全局置顶反而会盖住其它程序窗口。
+    //   ⚠ 不加 WS_EX_TOPMOST — overlay 只需在 mpv 之上, 全局置顶反而会
+    //     盖住用户切换到的其它程序窗口 (Z-order 由 bring_above_mpv 维护)。
     DWORD ex_style = WS_EX_LAYERED
                    | WS_EX_TRANSPARENT
                    | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
@@ -325,14 +325,14 @@ ErrorCode WindowManager::create(HINSTANCE hInstance, uint32_t width,
     DANMAKU_LOG_INFO(LOG_TAG, "创建幽灵窗口: owner=0x%p x=%d y=%d w=%d h=%d dpi=%u",
                      mpv_hwnd_, x, y, w, h, dpi_.dpi_x);
 
-    hwnd_ = CreateWindowExW(
+hwnd_ = CreateWindowExW(
         ex_style,
         kClassName,
         L"mpv danmaku overlay",
         style,
         x, y, w, h,
-        mpv_hwnd_,         // owner = mpv (owned window, 保持在 mpv 之上)
-        nullptr,
+        mpv_hwnd_,           // owner = mpv (owned window, 恒在 mpv 之上)
+        nullptr,            // hMenu
         hinstance_,
         nullptr
     );
@@ -606,6 +606,132 @@ LRESULT WindowManager::wnd_proc(HWND hwnd, UINT msg,
 // 构造 / 析构
 // ============================================================
 
+namespace {
+// 相位计时 RAII: 只在诊断开启时取时间戳/累计耗时 (默认零开销)
+class DiagScope {
+public:
+    DiagScope(LayeredPresenter* p, int phase) : p_(p), phase_(phase) {
+        if (p_->diag_active()) QueryPerformanceCounter(&t0_);
+    }
+    ~DiagScope() {
+        if (p_->diag_active()) p_->diag_add_phase(phase_, t0_);
+    }
+
+private:
+    LayeredPresenter* p_;
+    int               phase_;
+    LARGE_INTEGER     t0_{};
+};
+} // namespace
+
+// ============================================================
+// 呈现诊断实现 (DANMAKU_DIAG=1)
+// ============================================================
+
+void LayeredPresenter::diag_tick_render() {
+    if (diag_on_) ++diag_renders_;
+}
+
+void LayeredPresenter::diag_add_phase(int phase, const LARGE_INTEGER& t0) {
+    if (!diag_active() || phase < 0 || phase > 5) return;
+
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    const double ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0
+                    / static_cast<double>(diag_freq_.QuadPart);
+
+    diag_ms_[phase] += ms;
+    if (ms > diag_ms_max_[phase]) diag_ms_max_[phase] = ms;
+    if (ms > 20.0) ++diag_slow20_[phase];
+    if (ms > 50.0) ++diag_slow50_[phase];
+}
+
+void LayeredPresenter::diag_flush_if_due(uint32_t active_danmaku,
+                                         double target_fps) {
+    if (!diag_active() || !swap_chain_) return;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (diag_win_start_.QuadPart == 0) {
+        diag_win_start_ = now;
+        return;
+    }
+    const double secs = static_cast<double>(now.QuadPart - diag_win_start_.QuadPart)
+                      / static_cast<double>(diag_freq_.QuadPart);
+    if (secs < 1.0) return;
+
+    // DWM / DXGI 侧真实取帧计数: PresentCount(我们提交成功数, 由 DXGI 记账),
+    // PresentRefreshCount(最近一帧被显示时的刷新计数),
+    // SyncRefreshCount(最近一次与 DWM 同步的刷新计数)。
+    // 若 dPc 远大于 dPr, 说明我们的提交未被 DWM 按帧取用 -> 合成侧吞帧。
+    unsigned long d_pc = 0, d_pr = 0, d_sr = 0;
+    DXGI_FRAME_STATISTICS fs = {};
+    if (SUCCEEDED(swap_chain_->GetFrameStatistics(&fs))) {
+        if (!diag_fs_valid_) {
+            diag_fs_valid_ = true;
+            diag_fs_pc_ = fs.PresentCount;
+            diag_fs_pr_ = fs.PresentRefreshCount;
+            diag_fs_sr_ = fs.SyncRefreshCount;
+        }
+        d_pc = static_cast<unsigned long>(fs.PresentCount - diag_fs_pc_);
+        d_pr = static_cast<unsigned long>(fs.PresentRefreshCount - diag_fs_pr_);
+        d_sr = static_cast<unsigned long>(fs.SyncRefreshCount - diag_fs_sr_);
+        diag_fs_pc_ = fs.PresentCount;
+        diag_fs_pr_ = fs.PresentRefreshCount;
+        diag_fs_sr_ = fs.SyncRefreshCount;
+    }
+
+    const uint32_t r = diag_renders_;
+    const uint32_t p = diag_presents_;
+    const double avg[6] = {
+        r ? diag_ms_[0] / r : 0.0,
+        r ? diag_ms_[1] / r : 0.0,
+        p ? diag_ms_[2] / p : 0.0,
+        p ? diag_ms_[3] / p : 0.0,
+        r ? diag_ms_[4] / r : 0.0,
+        r ? diag_ms_[5] / r : 0.0
+    };
+
+    DANMAKU_LOG_INFO(LOG_TAG,
+        "DIAG %.2fs render=%u present=%u hr_fail=%u occl=%u lastHR=0x%08X | "
+        "begin[avg=%.2f max=%.2f o20=%u o50=%u] draw[avg=%.2f max=%.2f o20=%u o50=%u] "
+        "present[avg=%.2f max=%.2f o20=%u o50=%u] gpu[avg=%.2f max=%.2f o20=%u o50=%u] "
+        "engine[avg=%.2f max=%.2f o20=%u o50=%u] evdraw[avg=%.2f max=%.2f o20=%u o50=%u] "
+        "| fstat dPc=%lu dPr=%lu dSr=%lu "
+        "cum=%lu/%lu/%lu | danmaku=%u target_fps=%.0f hdr=%d "
+        "| dwm[frames=%u late=%u maxgap=%.1fms rate=%.1fHz yield=%d]",
+        secs, r, p, diag_present_fail_, diag_present_occluded_,
+            diag_present_hr_last_,
+        avg[0], diag_ms_max_[0], diag_slow20_[0], diag_slow50_[0],
+        avg[1], diag_ms_max_[1], diag_slow20_[1], diag_slow50_[1],
+        avg[2], diag_ms_max_[2], diag_slow20_[2], diag_slow50_[2],
+        avg[3], diag_ms_max_[3], diag_slow20_[3], diag_slow50_[3],
+        avg[4], diag_ms_max_[4], diag_slow20_[4], diag_slow50_[4],
+        avg[5], diag_ms_max_[5], diag_slow20_[5], diag_slow50_[5],
+        d_pc, d_pr, d_sr,
+        static_cast<unsigned long>(diag_fs_pc_),
+        static_cast<unsigned long>(diag_fs_pr_),
+        static_cast<unsigned long>(diag_fs_sr_),
+        active_danmaku, target_fps, hdr_active_ ? 1 : 0,
+        diag_dwm_, diag_dwm_late_, diag_dwm_max_ms_, comp_rate_hz_,
+        gpu_yield_demoted_ ? 1 : 0);
+
+    diag_dwm_        = 0;
+    diag_dwm_late_   = 0;
+    diag_dwm_max_ms_ = 0.0;
+    diag_win_start_ = now;
+    diag_renders_          = 0;
+    diag_presents_         = 0;
+    diag_present_fail_     = 0;
+    diag_present_occluded_ = 0;
+    for (int i = 0; i < 6; ++i) {
+        diag_ms_[i]     = 0.0;
+        diag_ms_max_[i] = 0.0;
+        diag_slow20_[i] = 0;
+        diag_slow50_[i] = 0;
+    }
+}
+
 LayeredPresenter::LayeredPresenter() {}
 LayeredPresenter::~LayeredPresenter() { shutdown(); }
 
@@ -615,10 +741,23 @@ LayeredPresenter::~LayeredPresenter() { shutdown(); }
 
 ErrorCode LayeredPresenter::initialize(HWND hwnd, uint32_t width,
                                        uint32_t height, DpiInfo dpi) {
-    hwnd_ = hwnd;
+hwnd_ = hwnd;
     phys_width_  = width;
     phys_height_ = height;
     dpi_ = dpi;
+
+    // 呈现诊断 (默认关闭, 由环境变量 DANMAKU_DIAG=1 打开)
+    if (diag_freq_.QuadPart == 0) {
+        QueryPerformanceFrequency(&diag_freq_);
+        const char* env = std::getenv("DANMAKU_DIAG");
+        diag_on_ = (env && env[0] == '1');
+        QueryPerformanceCounter(&diag_win_start_);
+        if (diag_on_) DANMAKU_LOG_INFO(LOG_TAG, "呈现诊断已开启 (DANMAKU_DIAG=1)");
+
+        // DWM 合成间隔作为让出信号 (默认开; DANMAKU_YIELD_DWM=0 关闭做对照)
+        const char* ydwm = std::getenv("DANMAKU_YIELD_DWM");
+        gpu_yield_use_dwm_ = !(ydwm && ydwm[0] == '0');
+    }
 
     ErrorCode ec = init_d3d11();
     if (ec != ErrorCode::Ok) return ec;
@@ -1160,8 +1299,10 @@ ErrorCode LayeredPresenter::resize(uint32_t width, uint32_t height) {
 // ============================================================
 
 HRESULT LayeredPresenter::begin_frame() {
+    DiagScope diag_scope(this, 0);
     if (!swap_chain_ || !d2d_context_) return E_FAIL;
 
+    // 诊断实验: 等可等待对象 (只影响 experiment 路径)
     // 获取当前 back buffer (flip model 每帧轮换)
     back_buffer_.Reset();
     HRESULT hr = swap_chain_->GetBuffer(
@@ -1212,6 +1353,7 @@ HRESULT LayeredPresenter::begin_frame() {
 }
 
 HRESULT LayeredPresenter::end_frame() {
+    DiagScope diag_scope(this, 1);
     if (hdr_active_) {
         if (!hdr_scratch_ctx_) return E_FAIL;
         HRESULT hr = hdr_scratch_ctx_->EndDraw();
@@ -1228,6 +1370,266 @@ HRESULT LayeredPresenter::end_frame() {
 // ============================================================
 // present - 提交帧: 释放引用 → 施加透明度 → Present → Commit
 // ============================================================
+
+// ============================================================
+// GPU 调度优先级让出
+// ============================================================
+//
+// 现象 (本机实测, mpv --gpu-api=d3d11 + VS/RIFE 满载 + mpv 处于前台焦点):
+//   · 本 overlay 的 Present 单帧阻塞 30~50ms (峰值 100ms+), 上屏可见更新率
+//     掉到 13~22 次/秒, 弹幕肉眼明显丢帧;
+//   · 同一时刻我们自己绘制在 GPU 上的完成耗时只有 0.2ms (diag 的 gpu 相位),
+//     说明瓶颈不是"我们画得慢", 而是我们的帧迟迟未被系统合成送上屏;
+//   · mpv 失焦时同一负载下不出现该现象; mpv 改用 vulkan 后端也不出现
+//     (vulkan 路径的 GPU 占用/呈现方式不同, 不会把合成挤到无法推进)。
+//   把 mpv 进程的 GPU 调度优先级类临时降为 IDLE 后, 弹幕立即恢复到
+//   56~76 次/秒 —— 即前台满载的播放器长期占住 GPU 队列, 把系统合成的
+//   工作挤到几乎无法推进 (GPU 工作按调度优先级类仲裁)。
+//
+// 处理: 只在检测到"持续呈现背压"时降级 (见 gpu_yield_tick 的判定), 弹幕空闲
+//   或背压消失后立即恢复; 退出时归还。未出现背压的场景 (例如 mpv 用 vulkan
+//   后端、mpv 不在前台、没有挂重滤镜) 永不触发, 因此不影响原本正常的路径。
+//   可用环境变量 DANMAKU_NO_GPUPRIO=1 关闭该机制 (用于对照排查)。
+
+namespace {
+
+// gdi32!D3DKMTSetProcessSchedulingPriorityClass 的级别取值:
+//   0=IDLE 1=BELOW_NORMAL 2=NORMAL 3=ABOVE_NORMAL 4=HIGH 5=REALTIME
+constexpr int kGpuClassIdle   = 0;
+// 恢复值用普通应用的默认值: 读取目标进程的优先级类会被系统拒绝
+// (STATUS_ACCESS_DENIED), 无法取回"原值"。
+constexpr int kGpuClassNormal = 2;
+
+// Present 单帧耗时超过该值即视为"被节流" (正常为亚毫秒)
+constexpr double kBlockedPresentMs = 6.0;
+
+} // namespace
+
+void LayeredPresenter::gpu_yield_apply(bool demote, bool log_msg) {
+    if (gpu_yield_pid_ == 0) return;
+
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+                              FALSE, static_cast<DWORD>(gpu_yield_pid_));
+    if (!proc) {
+        if (log_msg) {
+            DANMAKU_LOG_WARN(LOG_TAG,
+                             "GPU 优先级让出: 打开目标进程失败 (pid=%u, GLE=%lu)",
+                             gpu_yield_pid_, GetLastError());
+        }
+        return;
+    }
+
+    static int (WINAPI *set_class)(HANDLE, int) = nullptr;
+    static bool api_checked = false;
+    if (!api_checked) {
+        api_checked = true;
+        HMODULE gdi = LoadLibraryA("gdi32.dll");
+        if (gdi) {
+            set_class = reinterpret_cast<int (WINAPI*)(HANDLE, int)>(
+                reinterpret_cast<void*>(
+                    GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass")));
+        }
+    }
+
+    if (set_class) {
+        const int cls = demote ? kGpuClassIdle : kGpuClassNormal;
+        const int st = set_class(proc, cls);
+        if (log_msg) {
+            DANMAKU_LOG_INFO(LOG_TAG,
+                             "GPU 优先级让出: pid=%u GPU 调度优先级 -> %s (status=0x%08X)",
+                             gpu_yield_pid_, demote ? "IDLE" : "NORMAL",
+                             static_cast<unsigned>(st));
+        }
+    } else if (log_msg) {
+        DANMAKU_LOG_WARN(LOG_TAG,
+                         "GPU 优先级让出: 系统未提供 "
+                         "D3DKMTSetProcessSchedulingPriorityClass, 已跳过");
+    }
+    CloseHandle(proc);
+}
+
+void LayeredPresenter::gpu_yield_tick(bool presented, double present_ms) {
+    if (gpu_yield_pid_ == 0) return;
+
+    if (gpu_yield_freq_.QuadPart == 0) {
+        QueryPerformanceFrequency(&gpu_yield_freq_);
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        gpu_yield_next_.QuadPart = now.QuadPart + gpu_yield_freq_.QuadPart;
+    }
+
+    if (presented) {
+        ++gpu_yield_win_frames_;
+        if (present_ms >= kBlockedPresentMs) ++gpu_yield_win_slow_;
+    }
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart < gpu_yield_next_.QuadPart) return;
+
+    const uint32_t frames = gpu_yield_win_frames_;
+    const uint32_t slow   = gpu_yield_win_slow_;
+    const uint32_t dwm    = gpu_yield_win_dwm_;
+    const uint32_t dwm_late = gpu_yield_win_dwm_late_;
+    gpu_yield_win_frames_ = 0;
+    gpu_yield_win_slow_   = 0;
+    gpu_yield_win_dwm_      = 0;
+    gpu_yield_win_dwm_late_ = 0;
+    gpu_yield_next_.QuadPart = now.QuadPart + gpu_yield_freq_.QuadPart;
+
+    // "持续呈现背压" (两个独立信号, 任一成立即可):
+    //  1) Present 阻塞: 窗口内帧数足够多, 且至少 1/4 的帧卡在 Present 里
+    //     (d3d11 后端前台满载时的典型表现);
+    //  2) DWM 合成变慢: 窗口内观察到的 DWM 帧里, 至少 1/3 的帧间隔 > 1.6 个周期。
+    //     flip-discard 下 Present 常不阻塞 (旧帧被直接顶掉), 例如 vulkan 后端
+    //     且只有 mpv 一个窗口时, 此时只有 DWM 实际合成间隔能反映"合成被饿"。
+    // 两者都无 (Present 亚毫秒 + DWM 按刷新率走 / 弹幕空闲) 时永不触发。
+    const bool backpressure =
+        ((frames >= 10) && (slow * 4 >= frames)) ||
+        (gpu_yield_use_dwm_ && dwm >= 5 && dwm_late * 3 >= dwm);
+
+    if (backpressure) {
+        gpu_yield_ok_streak_   = 0;
+        gpu_yield_idle_streak_ = 0;
+        const bool first = !gpu_yield_demoted_;
+        gpu_yield_demoted_ = true;
+        // 幂等重发: 防止系统在窗口激活等时机把优先级改回去
+        gpu_yield_apply(true, first);
+        return;
+    }
+    if (!gpu_yield_demoted_) return;
+
+    // "何时还回去"的策略。要点: 降级之后本就会变得"无背压", 若一见到无背压
+    // 就恢复, 会每秒反复横跳。两种恢复条件:
+    //   1) 弹幕空闲 (窗口内没有任何帧: 暂停/空屏/关闭渲染): 连续 3s 即恢复;
+    //   2) 有帧但持续无背压 (例如中途把重滤镜关掉): 连续 10s 试探性恢复,
+    //      并进入 120s 冷却; 若背压立刻重现则在冷却期内稳定保持降级。
+    if (now.QuadPart < gpu_yield_cooldown_.QuadPart) return;
+
+    if (frames == 0) {
+        gpu_yield_ok_streak_ = 0;
+        if (++gpu_yield_idle_streak_ >= 3) {
+            gpu_yield_apply(false, true);
+            gpu_yield_demoted_     = false;
+            gpu_yield_idle_streak_ = 0;
+        }
+        return;
+    }
+
+    gpu_yield_idle_streak_ = 0;
+    if (++gpu_yield_ok_streak_ >= 10) {
+        gpu_yield_apply(false, true);
+        gpu_yield_demoted_   = false;
+        gpu_yield_ok_streak_ = 0;
+        gpu_yield_cooldown_.QuadPart = now.QuadPart + 120 * gpu_yield_freq_.QuadPart;
+    }
+}
+
+// ============================================================
+// 合成器时钟对齐 (见头文件说明)
+// ============================================================
+
+void LayeredPresenter::gpu_yield_note_dwm_interval(double ms) {
+    // 诊断统计 (diag 关闭时也只是几次加法)
+    const bool late = ms > comp_nominal_ms_ * 1.6;
+    ++diag_dwm_;
+    if (late) ++diag_dwm_late_;
+    if (ms > diag_dwm_max_ms_) diag_dwm_max_ms_ = ms;
+
+    if (gpu_yield_pid_ == 0) return;
+    ++gpu_yield_win_dwm_;
+    if (late) ++gpu_yield_win_dwm_late_;
+}
+
+void LayeredPresenter::observe_dwm_frame() {
+    if (!dcomp_device_) return;
+
+    static LONGLONG s_qpc_freq = []{
+        LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+
+    DCOMPOSITION_FRAME_STATISTICS fs = {};
+    if (FAILED(dcomp_device_->GetFrameStatistics(&fs))) return;
+    if (fs.timeFrequency.QuadPart <= 0) return;
+
+    // 合成速率 (DXGI_RATIONAL, 帧/秒); 取值不合理则保持旧值
+    if (fs.currentCompositionRate.Denominator != 0) {
+        const double hz = static_cast<double>(fs.currentCompositionRate.Numerator)
+                        / static_cast<double>(fs.currentCompositionRate.Denominator);
+        if (hz >= 10.0 && hz <= 1000.0) {
+            comp_rate_hz_    = hz;
+            comp_nominal_ms_ = 1000.0 / hz;
+        }
+    }
+
+    const LONGLONG t = fs.lastFrameTime.QuadPart;
+    if (t != 0 && t != comp_last_frame_) {
+        if (comp_last_frame_ != 0) {
+            const double ms = static_cast<double>(t - comp_last_frame_) * 1000.0
+                            / static_cast<double>(fs.timeFrequency.QuadPart);
+            // >500ms 视为空闲/暂停后的恢复, 不是合成变慢, 忽略
+            if (ms > 0.0 && ms < 500.0) gpu_yield_note_dwm_interval(ms);
+        }
+        comp_last_frame_ = t;
+    }
+    (void)s_qpc_freq;
+}
+
+bool LayeredPresenter::wait_compositor_tick(DWORD timeout_ms) {
+    // DCompositionWaitForCompositorClock: Win10 1703+, 阻塞到合成器下一次 tick。
+    // 动态取址, 老系统回退到 DwmFlush (同样阻塞到下一次 DWM 合成)。
+    using WaitFn = DWORD (WINAPI*)(UINT, const HANDLE*, DWORD);
+    static WaitFn s_wait = []() -> WaitFn {
+        HMODULE m = LoadLibraryW(L"dcomp.dll");
+        if (!m) return nullptr;
+        return reinterpret_cast<WaitFn>(reinterpret_cast<void*>(
+            GetProcAddress(m, "DCompositionWaitForCompositorClock")));
+    }();
+
+    bool ticked = false;
+    if (s_wait) {
+        // count=0: 只等合成器时钟; 返回 WAIT_OBJECT_0 + 0 表示时钟 tick
+        const DWORD r = s_wait(0, nullptr, timeout_ms);
+        ticked = (r == WAIT_OBJECT_0);
+    } else {
+        ticked = SUCCEEDED(DwmFlush());
+    }
+
+    if (ticked) observe_dwm_frame();
+    return ticked;
+}
+
+bool LayeredPresenter::predict_next_frame_qpc(LONGLONG& out_qpc) {
+    if (!dcomp_device_) return false;
+
+    static LONGLONG s_qpc_freq = []{
+        LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+
+    DCOMPOSITION_FRAME_STATISTICS fs = {};
+    if (FAILED(dcomp_device_->GetFrameStatistics(&fs))) return false;
+    // 统计时基必须就是 QPC, 否则无法与引擎时钟比较
+    if (fs.timeFrequency.QuadPart != s_qpc_freq) return false;
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+
+    LONGLONG t = fs.nextEstimatedFrameTime.QuadPart;
+    if (t <= 0) return false;
+
+    // 估计值若已落在过去 (统计滞后), 按合成周期向后推到未来
+    const LONGLONG period = static_cast<LONGLONG>(
+        comp_nominal_ms_ / 1000.0 * static_cast<double>(s_qpc_freq));
+    if (period <= 0) return false;
+    if (t < now.QuadPart) {
+        const LONGLONG k = (now.QuadPart - t) / period + 1;
+        if (k > 8) return false;           // 偏差过大, 不可信
+        t += k * period;
+    }
+    // 超过 100ms 以后的预测同样不可信
+    if (t - now.QuadPart > s_qpc_freq / 10) return false;
+
+    out_qpc = t;
+    return true;
+}
 
 void LayeredPresenter::present(float global_alpha) {
     if (!swap_chain_ || !dcomp_visual_) return;
@@ -1249,9 +1651,42 @@ void LayeredPresenter::present(float global_alpha) {
         back_buffer_.Reset();
     }
 
-    // Present(0,0): 不等待 vsync，由 DanmakuEngine 控制帧率,
+// Present(0,0): 不等待 vsync，由 DanmakuEngine 控制帧率,
     // DWM 在下一次合成周期 (显示器 vsync) 读取新帧。
-    swap_chain_->Present(0, 0);
+    // 诊断: 让 GPU 报告"本帧绘制已完成"的时刻, 用于区分
+    //   "我们自己的绘制被 GPU 饿死" 与 "Present 提交被 DWM 阻塞"。
+    if (diag_active() && d3d_context_ && d3d_device_) {
+        if (!diag_fence_) {
+            D3D11_QUERY_DESC qd = {};
+            qd.Query = D3D11_QUERY_EVENT;
+            d3d_device_->CreateQuery(&qd, diag_fence_.GetAddressOf());
+        }
+        if (diag_fence_) {
+            LARGE_INTEGER tf{};
+            QueryPerformanceCounter(&tf);
+            d3d_context_->End(diag_fence_.Get());
+            d3d_context_->Flush();
+            d3d_context_->GetData(diag_fence_.Get(), nullptr, 0, 0);
+            diag_add_phase(3, tf);
+        }
+    }
+
+    // 计时 (恒定开销: 两次 QPC): 供背压判定使用; diag 打开时复用同一时刻。
+    static LARGE_INTEGER s_freq = []{ LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER t0{};
+    QueryPerformanceCounter(&t0);
+    const HRESULT phr = swap_chain_->Present(0, 0);
+    LARGE_INTEGER t1{};
+    QueryPerformanceCounter(&t1);
+    gpu_yield_tick(true, static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0
+                        / static_cast<double>(s_freq.QuadPart));
+    if (diag_active()) {
+        ++diag_presents_;
+        diag_present_hr_last_ = static_cast<unsigned>(phr);
+        if (phr == DXGI_STATUS_OCCLUDED) ++diag_present_occluded_;
+        else if (FAILED(phr))            ++diag_present_fail_;
+        diag_add_phase(2, t0);
+    }
 }
 
 // ============================================================
@@ -1259,6 +1694,13 @@ void LayeredPresenter::present(float global_alpha) {
 // ============================================================
 
 void LayeredPresenter::shutdown() {
+    // 先归还被临时降级的 GPU 调度优先级 (不把 mpv 留在异常状态)
+    if (gpu_yield_demoted_) {
+        gpu_yield_apply(false, true);
+        gpu_yield_demoted_ = false;
+    }
+    gpu_yield_pid_ = 0;
+
     // 先释放 per-frame 引用
     if (d2d_context_) d2d_context_->SetTarget(nullptr);
     d2d_target_.Reset();
@@ -1273,8 +1715,11 @@ void LayeredPresenter::shutdown() {
     dcomp_target_.Reset();
     dcomp_device_.Reset();
 
-    swap_chain_.Reset();
+swap_chain_.Reset();
     dxgi_factory2_.Reset();
+
+    // 诊断实验: 可等待对象句柄
+    
 
     // HDR 离屏 AA 路径
     destroy_hdr_scratch();
@@ -1334,7 +1779,7 @@ ErrorCode LayeredPresenter::create_swap_chain(DXGI_FORMAT format) {
     scd.Stereo      = FALSE;
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;                              // flip model 至少 2
     scd.Scaling     = DXGI_SCALING_STRETCH;
     scd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;

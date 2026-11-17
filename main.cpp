@@ -21,6 +21,7 @@
 
 #include <shellapi.h>
 #include <mmsystem.h>
+#include <cstdlib>
 #include <future>
 #include <chrono>
 
@@ -37,6 +38,7 @@ struct AppContext {
     IpcServer*      ipc    = nullptr;
 
     RenderConfig    render_config;
+    uint32_t        mpv_pid = 0;             // mpv 进程 ID (GPU 优先级让出的目标)
 
     std::atomic<bool>  running{true};        // 主消息循环运行标志
     std::atomic<bool>  render_running{false};// 渲染线程运行标志
@@ -78,7 +80,22 @@ static void render_thread_main(AppContext* ctx) {
         CoUninitialize();
         return;
     }
+
     ctx->engine_ready.set_value(true);
+
+    // 启用"检测到持续呈现背压时, 让占住 GPU 队列的 mpv 临时让出调度优先级"。
+    // 判定条件与原理见 layered_presenter.cpp 的 "GPU 调度优先级让出" 一节。
+    // DANMAKU_NO_GPUPRIO=1 可关闭 (对照排查用); 未出现背压的场景永不触发。
+    {
+        const char* off = std::getenv("DANMAKU_NO_GPUPRIO");
+        if (!(off && off[0] == '1')) {
+            ctx->engine->set_mpv_gpu_pid(ctx->mpv_pid);
+            DANMAKU_LOG_INFO(LOG_TAG, "GPU 优先级让出已启用 (目标 pid=%u)",
+                             ctx->mpv_pid);
+        } else {
+            DANMAKU_LOG_INFO(LOG_TAG, "GPU 优先级让出已禁用 (DANMAKU_NO_GPUPRIO=1)");
+        }
+    }
 
     DANMAKU_LOG_INFO(LOG_TAG, "渲染线程进入帧率锁定循环");
     constexpr DWORD kIdlePollMs = 8;   // 空闲轮询间隔 (无动画时降到 ~125Hz, 省高频空转)
@@ -87,6 +104,8 @@ static void render_thread_main(AppContext* ctx) {
         if (ctx->engine->render()) {
             ctx->engine->wait_for_next_frame();
         } else {
+            // 空闲也推进让出统计窗口, 弹幕空闲后及时归还优先级
+            ctx->engine->notify_idle_frame();
             Sleep(kIdlePollMs);
         }
     }
@@ -193,15 +212,19 @@ static BOOL CALLBACK enum_windows_proc(HWND hwnd, LPARAM lParam) {
     return FALSE; // 找到了, 停止枚举
 }
 
-static HWND find_mpv_hwnd(uint32_t pid) {
+// 单次枚举, 不睡眠 (主循环里使用, 绝不能阻塞消息泵)
+static HWND find_mpv_hwnd_once(uint32_t pid) {
     if (pid == 0) return nullptr;
     EnumCtx ctx{ static_cast<DWORD>(pid), nullptr };
+    EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.result;
+}
 
-    // mpv 可能尚未创建窗口, 最多等待 ~3 秒
+// 启动阶段使用: mpv 可能尚未创建窗口, 最多等待 ~3 秒 (此时还没有任何窗口/消息泵)
+static HWND find_mpv_hwnd(uint32_t pid) {
+    if (pid == 0) return nullptr;
     for (int i = 0; i < 30; ++i) {
-        ctx.result = nullptr;
-        EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&ctx));
-        if (ctx.result) return ctx.result;
+        if (HWND h = find_mpv_hwnd_once(pid)) return h;
         Sleep(100);
     }
     return nullptr;
@@ -350,8 +373,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         }
     }
 
-    // 告诉 WindowManager 要跟踪的 mpv 窗口
+// 告诉 WindowManager 要跟踪的 mpv 窗口 (同时维护 overlay 的 Z-order)
     window.set_mpv_hwnd(args.mpv_hwnd);
+
+    // GPU 优先级让出的目标进程 (mpv): 处理"前台满载的 mpv 占住 GPU 队列,
+    // 使系统合成无法按帧推进, 弹幕上屏更新率暴跌"的问题。
+    ctx.mpv_pid = args.mpv_pid;
+    if (ctx.mpv_pid == 0 && args.mpv_hwnd && IsWindow(args.mpv_hwnd)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(args.mpv_hwnd, &pid);
+        ctx.mpv_pid = static_cast<uint32_t>(pid);
+    }
 
     // 渲染配置
     danmaku_overlay::RenderConfig config;
@@ -414,6 +446,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     // 渲染循环由渲染线程负责, 主线程空闲时 Sleep 避免忙等。
     MSG msg = {};
     uint32_t last_w = 0, last_h = 0;  // 跟踪窗口尺寸变化
+    ULONGLONG lost_since = 0;         // mpv 窗口开始丢失的时刻 (0=未丢失)
+    ULONGLONG next_probe = 0;         // 下次重新查找窗口的时刻
     while (ctx.running.load(std::memory_order_acquire)) {
         // 处理窗口消息 (非阻塞)
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -436,21 +470,39 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         }
 
         if (!IsWindow(args.mpv_hwnd)) {
-            // 窗口句柄失效: 先用 PID 找回 mpv 重建的新窗口
-            HWND new_hwnd = find_mpv_hwnd(args.mpv_pid);
-            if (new_hwnd && new_hwnd != args.mpv_hwnd) {
-                DANMAKU_LOG_INFO(LOG_TAG,
-                    "mpv 窗口已重建, 重新绑定: 0x%p -> 0x%p",
-                    args.mpv_hwnd, new_hwnd);
-                args.mpv_hwnd = new_hwnd;
-                window.set_mpv_hwnd(new_hwnd);  // 同步 owner 并抬回 mpv 上方
-                continue;
+            // 窗口句柄失效。⚠ 这里绝不能阻塞: 本线程拥有 overlay 窗口, mpv 销毁
+            // owner 窗口时系统要在本线程上同步销毁 owned 窗口; 若此处睡眠/长循环,
+            // 消息泵停转 → 窗口"无响应", mpv 退出也被拖住。
+            // 因此只做单次枚举, 按 200ms 节流, 其余时间照常泵消息。
+            const ULONGLONG t_now = GetTickCount64();
+            if (lost_since == 0) lost_since = t_now;
+            if (t_now >= next_probe) {
+                next_probe = t_now + 200;
+                if (ctx.mpv_pid) {
+                    HWND new_hwnd = find_mpv_hwnd_once(ctx.mpv_pid);
+                    if (new_hwnd && new_hwnd != args.mpv_hwnd) {
+                        DANMAKU_LOG_INFO(LOG_TAG,
+                            "mpv 窗口已重建, 重新绑定: 0x%p -> 0x%p",
+                            args.mpv_hwnd, new_hwnd);
+                        args.mpv_hwnd = new_hwnd;
+                        window.set_mpv_hwnd(new_hwnd);  // 同步 owner 并抬回 mpv 上方
+                        lost_since = 0;
+                        continue;
+                    }
+                    if (!process_alive(ctx.mpv_pid)) {
+                        DANMAKU_LOG_INFO(LOG_TAG,
+                            "mpv 进程已退出 (pid=%u), 结束主循环", ctx.mpv_pid);
+                        break;
+                    }
+                } else if (t_now - lost_since > 3000) {
+                    // 不知道 mpv 的 PID (只传了 HWND) 就无法判断进程存亡,
+                    // 窗口消失超过宽限期即视为 mpv 已关闭, 避免永远不退出。
+                    DANMAKU_LOG_INFO(LOG_TAG, "mpv 窗口已消失且无 PID 可查, 结束主循环");
+                    break;
+                }
             }
-            if (args.mpv_pid && !process_alive(args.mpv_pid)) {
-                DANMAKU_LOG_INFO(LOG_TAG,
-                    "mpv 进程已退出 (pid=%u), 结束主循环", args.mpv_pid);
-                break;
-            }
+        } else {
+            lost_since = 0;
         }
 
         // 收到 IPC shutdown 命令 (IpcServer 内部标志)
@@ -478,6 +530,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     // 清理
     DANMAKU_LOG_INFO(LOG_TAG, "danmaku_overlay 退出");
+
+    // 看门狗: 退出阶段任何同步调用 (线程 join / 管道 / D3D / 析构) 若被卡住,
+    // 3 秒后强制结束进程, 保证不会残留成"无响应"的孤儿进程。
+    // 内核对象 (互斥体/事件/管道) 随进程结束由系统回收; mpv 已关闭, 无需再归还其 GPU 优先级。
+    std::thread([] {
+        Sleep(3000);
+        TerminateProcess(GetCurrentProcess(), 0);
+    }).detach();
 
     ipc.shutdown();     // 先停 IPC, 避免其线程再访问引擎
     ctx.render_running.store(false, std::memory_order_release);

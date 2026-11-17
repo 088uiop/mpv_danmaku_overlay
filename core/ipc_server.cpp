@@ -218,25 +218,47 @@ void IpcServer::shutdown() {
 
     running_.store(false, std::memory_order_release);
 
-    DWORD listen_tid = listen_thread_id_.load(std::memory_order_acquire);
-    if (listen_tid != 0) {
-        HANDLE thread_handle = OpenThread(SYNCHRONIZE | THREAD_TERMINATE, FALSE, listen_tid);
-        if (thread_handle) {
-            for (int i = 0; i < 50; ++i) {
-                if (WaitForSingleObject(thread_handle, 0) == WAIT_OBJECT_0) break;
-                CancelSynchronousIo(thread_handle);
-                Sleep(1);
+    client_connected_.store(false, std::memory_order_release);
+
+    // 监听线程可能阻塞在 ConnectNamedPipe / WriteFile 等同步 IO 里。
+    // 旧实现只取消 ~50ms, 若此时线程恰好还没进入 ConnectNamedPipe (或尚未记录线程 ID),
+    // 取消落空, 之后线程永远阻塞, join 永不返回 → 进程卡死。
+    // 现在: 在 2 秒上限内反复 (a) 取消其同步 IO, (b) 自连一次管道唤醒 ConnectNamedPipe,
+    // 直到线程退出; 超时则放弃等待 (分离线程), 交给进程退出/看门狗收尾, 绝不无限 join。
+    bool listen_done = !listen_thread_.joinable();
+    if (!listen_done) {
+        HANDLE th = nullptr;
+        const ULONGLONG deadline = GetTickCount64() + 2000;
+        while (GetTickCount64() < deadline) {
+            if (!th) {
+                DWORD tid = listen_thread_id_.load(std::memory_order_acquire);
+                if (tid != 0)
+                    th = OpenThread(SYNCHRONIZE | THREAD_TERMINATE, FALSE, tid);
             }
-            CloseHandle(thread_handle);
+            if (th && WaitForSingleObject(th, 0) == WAIT_OBJECT_0) {
+                listen_done = true;
+                break;
+            }
+            if (th) CancelSynchronousIo(th);
+
+            HANDLE c = CreateFileW(pipe_name_, GENERIC_READ | GENERIC_WRITE, 0,
+                                   nullptr, OPEN_EXISTING, 0, nullptr);
+            if (c != INVALID_HANDLE_VALUE) CloseHandle(c);
+            Sleep(5);
         }
+        if (th) CloseHandle(th);
     }
 
     // 管道句柄的创建与关闭完全由监听线程管理 (谁创建谁关闭),
-    // 这里不再跨线程关闭 pipe_handle_, 消除句柄竞争与两次关闭的风险。
-    client_connected_.store(false, std::memory_order_release);
-
-    if (listen_thread_.joinable()) listen_thread_.join();
-    if (read_thread_.joinable())   read_thread_.join();
+    // 这里不跨线程关闭 pipe_handle_, 消除句柄竞争与两次关闭的风险。
+    if (listen_done) {
+        if (listen_thread_.joinable()) listen_thread_.join();
+        if (read_thread_.joinable())   read_thread_.join();
+    } else {
+        DANMAKU_LOG_WARN(LOG_TAG, "IPC 监听线程 2 秒内未退出, 放弃等待 (进程即将退出)");
+        if (listen_thread_.joinable()) listen_thread_.detach();
+        if (read_thread_.joinable())   read_thread_.detach();
+    }
 
     DANMAKU_LOG_INFO(LOG_TAG, "IpcServer 已关闭");
 }

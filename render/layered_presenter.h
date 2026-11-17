@@ -26,7 +26,7 @@ public:
 
     HWND get_hwnd() const { return hwnd_; }
 
-    void set_mpv_hwnd(HWND hwnd) {
+void set_mpv_hwnd(HWND hwnd) {
         mpv_hwnd_ = hwnd;
         if (hwnd_ && hwnd && IsWindow(hwnd)) {
             SetWindowLongPtrW(hwnd_, GWLP_HWNDPARENT,
@@ -58,7 +58,7 @@ private:
     LRESULT wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     bool register_window_class();
 
-    HWND        hwnd_      = nullptr;
+HWND        hwnd_      = nullptr;
     HWND        mpv_hwnd_  = nullptr;
     HINSTANCE   hinstance_ = nullptr;
     DpiInfo     dpi_;
@@ -96,10 +96,43 @@ public:
     bool valid() const;
     ErrorCode recreate_target();
 
-    // 每帧流程: begin_frame → (引擎绘制) → end_frame → present(alpha)
-    HRESULT begin_frame();
+// 每帧流程: begin_frame → (引擎绘制) → end_frame → present(alpha)
+HRESULT begin_frame();
     HRESULT end_frame();
     void present(float global_alpha);
+
+    // ── 前台满载播放器抢占 GPU 时的自适应让出 ──
+    //   设置目标进程 (mpv 的 pid)。原理与判定条件见 .cpp 中
+    //   "GPU 调度优先级让出" 一节: 只在检测到持续呈现背压时降级, 且可逆。
+    void set_gpu_yield_pid(uint32_t pid) { gpu_yield_pid_ = pid; }
+
+    // 空闲帧通知 (引擎未绘制时由渲染循环调用): 推进统计窗口, 使弹幕空闲后
+    // 及时把 mpv 的 GPU 调度优先级还回去。
+    void gpu_yield_idle_frame() { gpu_yield_tick(false, 0.0); }
+
+    // ── 合成器时钟对齐 (DWM 帧节拍) ──
+    //   不再用独立的 QPC 定时器猜 vsync 相位: 渲染线程每帧阻塞到 DWM 下一次
+    //   合成 tick 后再画并 Present, 弹幕位置则取"预计上屏时刻"的媒体时间。
+    //   好处: (1) 与显示刷新无拍频, 不会周期性重复/跳帧; (2) 渲染线程被调度
+    //   延迟、Present 偶发阻塞时, 位置仍与上屏时刻匹配; (3) 顺带观测 DWM 实际
+    //   合成间隔, 作为"合成被饿死"的判据 (见 gpu_yield_tick)。
+    // 返回 true = 确实等到了一次合成 tick; false = 超时/不支持, 调用方应退回定时器。
+    bool wait_compositor_tick(DWORD timeout_ms);
+    // 预计下一次合成 (即本帧被 DWM 取用) 的 QPC 时刻; 失败返回 false。
+    bool predict_next_frame_qpc(LONGLONG& out_qpc);
+    // DWM 当前合成速率 (Hz), 未知时为 60。
+    double compositor_rate_hz() const { return comp_rate_hz_; }
+
+    // ── 呈现诊断 (环境变量 DANMAKU_DIAG=1 时开启, 默认不产生任何开销) ──
+    // 用于区分「我们自己提交被节流」与「提交正常但 DWM 不按目标帧率取帧」:
+    //   分相位耗时 (begin_frame / EndDraw 绘制 / Present) + Present 返回码
+    //   + DXGI GetFrameStatistics 的 DWM 侧取帧计数。
+    bool diag_active() const {
+        return diag_on_ && diag_freq_.QuadPart != 0;
+    }
+    void diag_tick_render();                    // 每次 render() 调用一次
+    void diag_add_phase(int phase, const LARGE_INTEGER& t0);   // 0=begin 1=draw 2=present
+    void diag_flush_if_due(uint32_t active_danmaku, double target_fps);
 
     // HDR 模式 (开关/峰值经 IPC 设置, 由渲染线程 process_pending_hdr 消费)
     void request_hdr_enabled(bool enabled);
@@ -156,7 +189,7 @@ private:
     ComPtr<ID3D11Device>          d3d_device_;
     ComPtr<ID3D11DeviceContext>   d3d_context_;
 
-    // DXGI composition swap chain
+// DXGI composition swap chain
     ComPtr<IDXGIFactory2>         dxgi_factory2_;
     ComPtr<IDXGISwapChain1>       swap_chain_;
     ComPtr<ID3D11Texture2D>       back_buffer_;
@@ -213,6 +246,54 @@ private:
     ID3D11Texture2D*              bb_rtv_tex_[kBackBufferRtvSlots] = {};
     ComPtr<ID3D11RenderTargetView> bb_rtv_[kBackBufferRtvSlots];
     int                           bb_rtv_next_ = 0;
+
+// 呈现诊断状态 (仅渲染线程访问; 见 diag_* 方法)
+    bool          diag_on_     = false;
+    LARGE_INTEGER diag_freq_{};
+    LARGE_INTEGER diag_win_start_{};
+    uint32_t      diag_renders_          = 0;
+    uint32_t      diag_presents_         = 0;
+    uint32_t      diag_present_fail_     = 0;
+    uint32_t      diag_present_occluded_ = 0;
+    
+    unsigned      diag_present_hr_last_  = 0;
+    double        diag_ms_[6]            = {};
+    double        diag_ms_max_[6]        = {};
+    uint32_t      diag_slow20_[6]        = {};
+    uint32_t      diag_slow50_[6]        = {};
+    ComPtr<ID3D11Query> diag_fence_;   // 诊断: 本帧绘制在 GPU 上真正完成的耗时
+
+    // GPU 调度优先级让出 (见 .cpp 中的实现注释)
+    void gpu_yield_tick(bool presented, double present_ms);
+    void gpu_yield_apply(bool demote, bool log_msg);
+    uint32_t      gpu_yield_pid_         = 0;      // 目标进程 (0 = 不启用)
+    bool          gpu_yield_demoted_     = false;  // 当前是否已降级
+    LARGE_INTEGER gpu_yield_freq_{};
+    LARGE_INTEGER gpu_yield_next_{};               // 下一个统计窗口的起点
+    LARGE_INTEGER gpu_yield_cooldown_{};           // 试探性恢复的冷却截止
+    uint32_t      gpu_yield_win_frames_  = 0;      // 本窗口 Present 次数
+    uint32_t      gpu_yield_win_slow_    = 0;      // 本窗口被阻塞的 Present 次数
+    uint32_t      gpu_yield_ok_streak_   = 0;      // 连续"有帧且无背压"窗口数
+    uint32_t      gpu_yield_idle_streak_ = 0;      // 连续"无帧"窗口数
+    // DWM 合成间隔信号: 本窗口观察到的 DWM 帧数 / 其中间隔明显偏长的帧数。
+    // 补充"Present 被阻塞"这一信号 —— flip-discard 下 Present 常常不阻塞,
+    // 而是已提交的帧在被 DWM 取用前被后一帧直接顶掉 (表现为丢帧但 Present 很快)。
+    uint32_t      gpu_yield_win_dwm_      = 0;
+    uint32_t      gpu_yield_win_dwm_late_ = 0;
+    bool          gpu_yield_use_dwm_      = true;  // DANMAKU_YIELD_DWM=0 关闭
+    void          gpu_yield_note_dwm_interval(double ms);
+    void          observe_dwm_frame();
+
+    // 合成器时钟状态
+    double        comp_rate_hz_      = 60.0;
+    double        comp_nominal_ms_   = 1000.0 / 60.0;
+    LONGLONG      comp_last_frame_   = 0;        // 上次观察到的 DWM lastFrameTime (QPC)
+    uint32_t      diag_dwm_          = 0;
+    uint32_t      diag_dwm_late_     = 0;
+    double        diag_dwm_max_ms_   = 0.0;
+
+    unsigned long diag_fs_pc_ = 0, diag_fs_pr_ = 0, diag_fs_sr_ = 0;
+    bool          diag_fs_valid_ = false;
 
     // IPC 线程写 → 渲染线程读
     std::atomic<bool>  hdr_enabled_pending_{false};
