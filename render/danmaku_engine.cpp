@@ -10,6 +10,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <mmsystem.h>   // timeBeginPeriod (仅在高分辨率定时器不可用时兜底)
 
 // Win10 1803+ 高分辨率可等待定时器标志 (旧 SDK 无此宏时兜底;
 // 更低版本系统上创建会失败, 代码自动退回 Sleep 路径)。
@@ -294,7 +295,13 @@ const GlyphEntry* GlyphCache::get_or_create(const std::string& text,
         return &it->second;
     }
 
-    while (cache_.size() >= max_entries_) evict_lru();
+    // 缓存已满: 淘汰最久未用条目。若本帧所有条目都在使用 (极端密集场景),
+    // evict_lru 一个都淘汰不掉, 必须退出循环避免死循环 (允许暂时超限)。
+    while (cache_.size() >= max_entries_) {
+        const size_t before = cache_.size();
+        evict_lru();
+        if (cache_.size() == before) break;
+    }
 
     GlyphEntry entry;
     entry.hash = key;
@@ -470,21 +477,32 @@ ErrorCode DanmakuEngine::initialize(HWND overlay_hwnd,
 
     QueryPerformanceFrequency(&qpc_freq_);
     QueryPerformanceCounter(&clock_base_qpc_);
-    frame_interval_ = 1.0 / static_cast<double>(config_.target_fps ? config_.target_fps : 60);
+    // target_fps <= 0: 自动模式, 每个合成 tick 提交一次 (帧率跟随刷新率)
+    auto_pace_ = !(config_.target_fps > 0.0);
+    frame_interval_ = auto_pace_ ? 0.0 : 1.0 / config_.target_fps;
     frame_qpc_ = clock_base_qpc_;
 
     // 高分辨率帧节拍定时器: 让 wait_for_next_frame 精确睡到帧截止, 把忙等自旋
-    // 从 ~1ms 压到 ~0.3ms, 高刷下尤其省 CPU。创建失败 (旧系统) 则用 Sleep 兜底。
+    // 从 ~1ms 压到 ~0.3ms, 高刷下尤其省 CPU。创建失败 (旧系统) 则抬高本进程
+    // 定时器精度兜底 (不再无条件 timeBeginPeriod, 避免全系统功耗上升)。
     if (!frame_timer_) {
         frame_timer_ = CreateWaitableTimerExW(
             nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!frame_timer_) {
+            timeBeginPeriod(1);
+            timer_period_raised_ = true;
+            DANMAKU_LOG_WARN(LOG_TAG,
+                "创建高分辨率定时器失败, 退回 timeBeginPeriod(1) 节拍");
+        }
     }
 
     {
         const char* p = std::getenv("DANMAKU_PACING");
         pace_compositor_ = !(p && std::string(p) == "timer");
-        DANMAKU_LOG_INFO(LOG_TAG, "帧节拍: %s",
-                         pace_compositor_ ? "DWM 合成器时钟" : "QPC 定时器");
+        DANMAKU_LOG_INFO(LOG_TAG, "帧节拍: %s", pace_compositor_
+                         ? (auto_pace_ ? "DWM 合成器时钟 (每 tick 一次)"
+                                       : "DWM 合成器时钟 (截止时刻驱动)")
+                         : "QPC 定时器");
     }
 
     initialized_ = true;
@@ -578,7 +596,12 @@ double DanmakuEngine::clock_now() const {
 }
 
 void DanmakuEngine::rebuild_active(TimePos t) {
-    for (AssEvent* ev : active_events_) ev->active = false;
+    for (AssEvent* ev : active_events_) {
+        ev->active = false;
+        // 布局条目可能已被 LRU 淘汰, 不能留悬空指针
+        ev->rt_glyph = nullptr;
+        ev->rt_font_size = -1.0f;
+    }
     active_events_.clear();
 
     // 前向游标: 第一条 start >= t 的事件
@@ -631,8 +654,9 @@ void DanmakuEngine::set_speed(double speed) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     if (!initialized_) return;
     if (speed <= 0) speed = 1.0;
-    TimePos cur = clock_now();
-    clock_base_time_ = cur;
+    // ⚠ clock_now() 已减去 delay_, 存回 base 时必须补回, 否则每次变速/暂停
+    //   都会再扣一次 delay (弹幕时间整体跳变)。
+    clock_base_time_ = clock_now() + delay_;
     clock_speed_     = speed;
     QueryPerformanceCounter(&clock_base_qpc_);
 }
@@ -641,24 +665,21 @@ void DanmakuEngine::set_paused(bool paused) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     if (!initialized_) return;
     if (paused == clock_paused_) return;
-    if (paused) {
-        clock_base_time_ = clock_now();
-        clock_paused_    = true;
-    } else {
-        clock_base_time_ = clock_now();
-        clock_paused_    = false;
-    }
+    // 同上: base 里不含 delay, clock_now() 含, 存回时补回
+    clock_base_time_ = clock_now() + delay_;
+    clock_paused_    = paused;
     QueryPerformanceCounter(&clock_base_qpc_);
     force_redraw_ = true;   // 暂停/恢复要补画一帧
 }
 
-void DanmakuEngine::set_delay(double seconds) {
+bool DanmakuEngine::set_delay(double seconds) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
-    if (!initialized_) return;
+    if (!initialized_) return false;
+    if (std::fabs(delay_ - seconds) < 1e-6) return false;   // 未变化: 不重复平移/重画
     delay_ = seconds;
     needs_reseek_  = true;   // 平移活跃集合 (保留滚动中弹幕, 视觉上是平移非闪断)
     force_redraw_ = true;
-    DANMAKU_LOG_INFO(LOG_TAG, "弹幕延迟调整为 %.3f 秒", seconds);
+    return true;
 }
 
 // ============================================================
@@ -667,7 +688,25 @@ void DanmakuEngine::set_delay(double seconds) {
 
 bool DanmakuEngine::render() {
 std::lock_guard<std::mutex> lock(engine_mutex_);
-    if (!initialized_ || !presenter_.context()) return false;
+    if (!initialized_) return false;
+
+    // 设备丢失 (驱动重置 / TDR): 重建图形资源与文本布局, 本帧跳过。
+    // 布局由旧设备的 DWrite/D2D 工厂创建, 必须一并作废。
+    if (presenter_.device_lost()) {
+        if (presenter_.recover_device() == ErrorCode::Ok) {
+            glyph_cache_.clear();
+            glyph_cache_.initialize(presenter_.dwrite_factory(),
+                                    presenter_.d2d_factory());
+            for (auto& ev : ass_doc_.events) {
+                ev.rt_glyph     = nullptr;
+                ev.rt_font_size = -1.0f;
+            }
+            force_redraw_ = true;
+        }
+        return false;
+    }
+
+    if (!presenter_.context()) return false;
 
     presenter_.diag_tick_render();
     LARGE_INTEGER diag_t_engine{};
@@ -746,12 +785,25 @@ std::lock_guard<std::mutex> lock(engine_mutex_);
     active_events_.erase(
         std::remove_if(active_events_.begin(), active_events_.end(),
             [&](AssEvent* ev) {
-                if (ev->end < time_pos) { ev->active = false; return true; }
+                if (ev->end < time_pos) {
+                    ev->active = false;
+                    // 布局条目可能已被 LRU 淘汰, 不能留悬空指针
+                    ev->rt_glyph = nullptr;
+                    ev->rt_font_size = -1.0f;
+                    return true;
+                }
                 return false;
             }),
         active_events_.end());
 
     glyph_cache_.tick();
+
+    // 先把本帧要用的布局全部标记为"本帧使用", 再开始绘制:
+    // 绘制过程中若有新条目触发淘汰, 不会误删本帧还要用的条目
+    // (这类条目指针缓存在 AssEvent::rt_glyph 上, 淘汰即悬空)。
+    for (AssEvent* ev : active_events_) {
+        if (ev->rt_glyph) glyph_cache_.touch(ev->rt_glyph->hash);
+    }
 
     // --- 3. 这一帧是否真的需要重画? ---
     // 弹幕位置只由媒体时间决定; 暂停时时间冻结 -> 整帧可跳过 (不读回+ULW)。
@@ -838,8 +890,6 @@ std::lock_guard<std::mutex> lock(engine_mutex_);
             ev->rt_glyph = glyph_cache_.get_or_create(
                 ev->text, font_size, bold, italic, fontname);
             ev->rt_font_size = font_size;
-        } else {
-            glyph_cache_.touch(ev->rt_glyph->hash);   // 续 LRU 命, 防悬空指针
         }
         const GlyphEntry* entry = ev->rt_glyph;
         if (!entry || !entry->layout) continue;
@@ -951,8 +1001,9 @@ std::lock_guard<std::mutex> lock(engine_mutex_);
     return true;
 }
 
-void DanmakuEngine::clear() {
+bool DanmakuEngine::clear() {
     std::lock_guard<std::mutex> lock(engine_mutex_);
+    const bool had_content = !ass_doc_.events.empty() || !active_events_.empty();
     active_events_.clear();
     ass_doc_.events.clear();
     ass_doc_.styles.clear();
@@ -960,6 +1011,7 @@ void DanmakuEngine::clear() {
     glyph_cache_.clear();
     last_frame_empty_ = false;
     force_redraw_     = true;
+    return had_content;
 }
 
 void DanmakuEngine::shutdown() {
@@ -968,6 +1020,10 @@ void DanmakuEngine::shutdown() {
     if (frame_timer_) {     // 无论初始化是否走完, 都回收定时器句柄
         CloseHandle(frame_timer_);
         frame_timer_ = nullptr;
+    }
+    if (timer_period_raised_) {   // 配对初始化时的 timeBeginPeriod(1)
+        timeEndPeriod(1);
+        timer_period_raised_ = false;
     }
     if (!initialized_) return;
 
@@ -991,25 +1047,25 @@ void DanmakuEngine::shutdown() {
 void DanmakuEngine::wait_for_next_frame() {
     if (qpc_freq_.QuadPart == 0) return;
 
-    // 优先对齐 DWM 合成 tick。target_fps 低于刷新率时按整数倍抽帧
-    // (如 144Hz/60fps -> 每 2 个 tick 画一次), 保证节奏均匀。
-    if (pace_compositor_) {
-        const double target = frame_interval_ > 0.0 ? 1.0 / frame_interval_ : 60.0;
-        int n = static_cast<int>(presenter_.compositor_rate_hz() / target + 0.15);
-        if (n < 1) n = 1;
-        if (n > 8) n = 8;
-        bool ok = true;
-        for (int i = 0; i < n && ok; ++i) ok = presenter_.wait_compositor_tick(50);
-        if (ok) { pace_fail_streak_ = 0; frame_qpc_.QuadPart = 0; return; }
-        if (++pace_fail_streak_ >= 5) {
+    // ---- 自动帧率 (target_fps<=0): 每个合成 tick 提交一次 ----
+    if (auto_pace_) {
+        if (pace_compositor_) {
+            if (presenter_.wait_compositor_tick(50)) {
+                pace_fail_streak_ = 0;
+                return;
+            }
+            if (++pace_fail_streak_ < 5) return;
             pace_compositor_ = false;
             DANMAKU_LOG_WARN(LOG_TAG, "等待合成器 tick 连续失败, 退回 QPC 定时器节拍");
         }
-        // 本帧退回定时器路径 (下面)
+        // 无合成器时钟可用: 降到 60fps 定时器节拍
+        auto_pace_ = false;
+        frame_interval_ = 1.0 / 60.0;
     }
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
+
     const LONGLONG interval =
         static_cast<LONGLONG>(frame_interval_ * qpc_freq_.QuadPart);
 
@@ -1021,6 +1077,35 @@ void DanmakuEngine::wait_for_next_frame() {
     if (now.QuadPart - frame_qpc_.QuadPart > interval * 3) {
         frame_qpc_ = now;
         return;
+    }
+
+    // ---- 合成器对齐: tick 只作为唤醒源, 到截止时刻才返回 ----
+    // 不再按"刷新率 / 目标帧率"做整数分频 (那样 144Hz 上要 60fps 实际会跑 72fps,
+    // 且无法表达 23.976 这类小数帧率)。这里以 QPC 截止时刻为准, 长期平均帧率
+    // 精确等于目标值; 非整数倍刷新率下会自然形成 2/3 tick 交替的节奏。
+    if (pace_compositor_) {
+        bool ok = true;
+        // 目标帧率高于刷新率: 以刷新率为上限 (每个 tick 一次)。
+        // 否则截止时刻会持续落后于实际时间, 退化成"每轮无等待连续提交"。
+        const double comp_hz = presenter_.compositor_rate_hz();
+        if (comp_hz > 1.0 && frame_interval_ > 0.0
+            && 1.0 / frame_interval_ > comp_hz + 0.5) {
+            frame_qpc_.QuadPart = 0;   // 下次调用重新对时
+            ok = presenter_.wait_compositor_tick(50);
+        } else {
+            for (;;) {
+                LARGE_INTEGER t;
+                QueryPerformanceCounter(&t);
+                if (t.QuadPart >= frame_qpc_.QuadPart) break;
+                if (!presenter_.wait_compositor_tick(50)) { ok = false; break; }
+            }
+        }
+        if (ok) { pace_fail_streak_ = 0; return; }
+        if (++pace_fail_streak_ >= 5) {
+            pace_compositor_ = false;
+            DANMAKU_LOG_WARN(LOG_TAG, "等待合成器 tick 连续失败, 退回 QPC 定时器节拍");
+        }
+        // 本帧退回定时器路径 (下面)
     }
 
     const LONGLONG delta = frame_qpc_.QuadPart - now.QuadPart;
@@ -1046,6 +1131,19 @@ void DanmakuEngine::wait_for_next_frame() {
     do {
         QueryPerformanceCounter(&now);
     } while (now.QuadPart < frame_qpc_.QuadPart);
+}
+
+void DanmakuEngine::wait_idle(uint32_t ms) {
+    // 空闲轮询同样走高分辨率定时器: 避免为了 1ms 精度而 timeBeginPeriod(1)。
+    if (frame_timer_ && ms > 0) {
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>(ms) * 10000LL;
+        if (SetWaitableTimer(frame_timer_, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(frame_timer_, ms + 50);
+            return;
+        }
+    }
+    Sleep(ms);
 }
 
 void DanmakuEngine::set_enabled(bool enabled) {
@@ -1078,24 +1176,17 @@ void DanmakuEngine::set_hdr_enabled(bool enabled) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     presenter_.request_hdr_enabled(enabled);
     force_redraw_ = true;
-    DANMAKU_LOG_INFO(LOG_TAG, "HDR 开关请求: %s", enabled ? "开启" : "关闭");
 }
 
 void DanmakuEngine::set_hdr_peak(float peak) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     presenter_.request_hdr_peak(peak);
     force_redraw_ = true;
-    DANMAKU_LOG_INFO(LOG_TAG, "HDR 峰值亮度请求: %.1f nits", peak);
 }
 
 uint32_t DanmakuEngine::get_active_count() const {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     return static_cast<uint32_t>(active_events_.size());
-}
-
-RenderConfig DanmakuEngine::get_config() const {
-    std::lock_guard<std::mutex> lock(engine_mutex_);
-    return config_;
 }
 
 } // namespace danmaku_overlay

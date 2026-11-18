@@ -175,7 +175,6 @@ inline DpiInfo GetWindowDpi(HWND hwnd) {
         if (pfn) {
             info.dpi_x = pfn(hwnd);
             info.dpi_y = info.dpi_x;
-            info.update();
             return info;
         }
     }
@@ -190,7 +189,6 @@ inline DpiInfo GetWindowDpi(HWND hwnd) {
             HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             // MDT_EFFECTIVE_DPI = 0
             if (SUCCEEDED(pfn(hmon, 0, &info.dpi_x, &info.dpi_y))) {
-                info.update();
                 FreeLibrary(shcore);
                 return info;
             }
@@ -200,66 +198,12 @@ inline DpiInfo GetWindowDpi(HWND hwnd) {
 
     // 最终回退: 96 DPI
     info.dpi_x = info.dpi_y = 96;
-    info.update();
     return info;
 }
 
 // 逻辑像素 -> 物理像素
 inline int LogicalToPhysical(int logical, uint32_t dpi) {
     return MulDiv(logical, dpi, 96);
-}
-
-// 物理像素 -> 逻辑像素
-inline int PhysicalToLogical(int physical, uint32_t dpi) {
-    return MulDiv(physical, 96, dpi);
-}
-
-// UTF-8 <-> UTF-16 转换
-inline std::wstring Utf8ToWide(const std::string& utf8) {
-    if (utf8.empty()) return L"";
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                                  static_cast<int>(utf8.size()),
-                                  nullptr, 0);
-    std::wstring wide(len, 0);
-    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                        static_cast<int>(utf8.size()),
-                        wide.data(), len);
-    return wide;
-}
-
-inline std::string WideToUtf8(const std::wstring& wide) {
-    if (wide.empty()) return "";
-    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
-                                   static_cast<int>(wide.size()),
-                                   nullptr, 0, nullptr, nullptr);
-    std::string utf8(len, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
-                        static_cast<int>(wide.size()),
-                        utf8.data(), len, nullptr, nullptr);
-    return utf8;
-}
-
-// UTF-16 -> UTF-32 (DirectWrite 需要 UTF-32 进行码点级排版)
-inline std::u32string WideToUtf32(const std::wstring& wide) {
-    std::u32string u32;
-    u32.reserve(wide.size());
-    size_t i = 0;
-    while (i < wide.size()) {
-        wchar_t c = wide[i];
-        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < wide.size()) {
-            // 代理对 (surrogate pair)
-            wchar_t c2 = wide[i + 1];
-            if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
-                uint32_t cp = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                u32.push_back(cp);
-                i += 2;
-                continue;
-            }
-        }
-        u32.push_back(static_cast<char32_t>(c));
-        i += 1;
-    }
-    return u32;
 }
 
 #pragma GCC diagnostic pop

@@ -44,20 +44,6 @@ struct AssColor {
         c.r = static_cast<uint8_t>(v & 0xFF);
         return c;
     }
-
-    // 转为 RGBA 浮点 (0-1, alpha 取反因为 ASS 0=不透明)
-    // 调用方用 D2D1::ColorF(r, g, b, a) 构造
-    struct FloatColor {
-        float r, g, b, a;
-    };
-    FloatColor to_float(float global_opacity = 1.0f) const {
-        FloatColor fc;
-        fc.a = (1.0f - static_cast<float>(a) / 255.0f) * global_opacity;
-        fc.r = static_cast<float>(r) / 255.0f;
-        fc.g = static_cast<float>(g) / 255.0f;
-        fc.b = static_cast<float>(b) / 255.0f;
-        return fc;
-    }
 };
 
 // ============================================================
@@ -192,19 +178,12 @@ struct AssDocument {
 // ============================================================
 struct RenderConfig {
 
-    uint32_t target_fps = 60;
-    bool     vsync = true;
+    // 目标渲染帧率 (Hz)。支持小数 (如 23.976); <=0 表示跟随合成器刷新率 (默认)。
+    double   target_fps = 0.0;
 
     float    opacity = 1.0f;          // 全局透明度
     float    font_scale = 1.0f;       // 全局字体缩放
     uint32_t max_danmaku = 200;       // 同屏最大弹幕数 (0=不限)
-    bool     bold = false;            // 全局加粗
-
-    uint32_t width = 1280;
-    uint32_t height = 720;
-    bool     borderless = true;
-
-    RenderConfig() = default;
 };
 
 // ============================================================
@@ -213,13 +192,6 @@ struct RenderConfig {
 struct DpiInfo {
     uint32_t dpi_x = 96;
     uint32_t dpi_y = 96;
-    float    scale_x = 1.0f;
-    float    scale_y = 1.0f;
-
-    void update() {
-        scale_x = static_cast<float>(dpi_x) / 96.0f;
-        scale_y = static_cast<float>(dpi_y) / 96.0f;
-    }
 };
 
 // ============================================================

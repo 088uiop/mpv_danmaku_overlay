@@ -20,10 +20,8 @@
 #include "render/danmaku_engine.h"
 
 #include <shellapi.h>
-#include <mmsystem.h>
 #include <cstdlib>
 #include <future>
-#include <chrono>
 
 namespace danmaku_overlay {
 
@@ -35,7 +33,6 @@ namespace danmaku_overlay {
 struct AppContext {
     WindowManager*  window = nullptr;
     DanmakuEngine*  engine = nullptr;
-    IpcServer*      ipc    = nullptr;
 
     RenderConfig    render_config;
     uint32_t        mpv_pid = 0;             // mpv 进程 ID (GPU 优先级让出的目标)
@@ -106,7 +103,7 @@ static void render_thread_main(AppContext* ctx) {
         } else {
             // 空闲也推进让出统计窗口, 弹幕空闲后及时归还优先级
             ctx->engine->notify_idle_frame();
-            Sleep(kIdlePollMs);
+            ctx->engine->wait_idle(kIdlePollMs);
         }
     }
 
@@ -194,7 +191,7 @@ struct CmdArgs {
     HWND     mpv_hwnd   = nullptr;
     wchar_t  pipe_name[256] = L"";
     wchar_t  log_path[512] = L"";
-    uint32_t target_fps  = 60;
+    double   target_fps  = 0.0;    // 默认跟随刷新率; >0 按指定帧率 (支持小数)
 };
 
 // EnumWindows 回调: 按 PID 反找主窗口
@@ -240,6 +237,38 @@ static bool process_alive(uint32_t pid) {
     return wait == WAIT_TIMEOUT;
 }
 
+// ============================================================
+// mpv 窗口几何变化监听 + 主循环低频率等待
+// ============================================================
+// 旧实现主线程每秒 1000 次 PeekMessage + 轮询 mpv 窗口; 现在改为:
+//   · WinEvent (EVENT_OBJECT_LOCATIONCHANGE) 通知窗口移动/缩放, 按需同步;
+//   · 主循环用高分辨率可等待定时器等待 ~8ms, 不再抬高全系统定时器精度。
+// 回调由系统在本线程泵消息时调用 (WINEVENT_OUTOFCONTEXT), 只置位标志。
+static std::atomic<HWND> g_tracked_mpv_hwnd{ nullptr };
+static std::atomic<bool> g_mpv_geom_dirty{ false };
+
+static void CALLBACK mpv_geom_event_proc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                         LONG id_object, LONG id_child,
+                                         DWORD, DWORD) {
+    if (event != EVENT_OBJECT_LOCATIONCHANGE) return;
+    if (id_object != OBJID_WINDOW || id_child != CHILDID_SELF) return;
+    if (hwnd != g_tracked_mpv_hwnd.load(std::memory_order_relaxed)) return;
+    g_mpv_geom_dirty.store(true, std::memory_order_relaxed);
+}
+
+// 高分辨率等待 (ms 级)。定时器句柄为空时退回 Sleep。
+static void wait_main_loop(HANDLE timer, DWORD ms) {
+    if (timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>(ms) * 10000LL;   // 100ns 单位
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer, ms + 50);
+            return;
+        }
+    }
+    Sleep(ms);
+}
+
 static CmdArgs parse_args(LPWSTR cmd_line) {
     CmdArgs args;
 
@@ -252,18 +281,27 @@ static CmdArgs parse_args(LPWSTR cmd_line) {
         if (arg == L"--mpv-pid" && i + 1 < argc) {
             swscanf_s(argv[++i], L"%u", &args.mpv_pid);
         } else if (arg == L"--mpv-hwnd" && i + 1 < argc) {
-            // 兼容: 直接传 HWND (十六进制)
-            unsigned long hwnd_val = 0;
-            if (swscanf_s(argv[++i], L"%lu", &hwnd_val) == 1 ||
-                swscanf_s(argv[i], L"0x%lx", &hwnd_val) == 1) {
-                args.mpv_hwnd = reinterpret_cast<HWND>(hwnd_val);
+            // 兼容: 直接传 HWND (十进制或 0x 十六进制)。
+            // ⚠ 不能用 swscanf_s("%lu"): "0x1234" 会把前导 0 解析成功并提前返回,
+            //   十六进制句柄会被静默解析成 0。用 wcstoul(base=0) 才能正确识别前缀。
+            const wchar_t* s = argv[++i];
+            wchar_t* end = nullptr;
+            const unsigned long hwnd_val = wcstoul(s, &end, 0);
+            if (end != s && hwnd_val != 0) {
+                args.mpv_hwnd = reinterpret_cast<HWND>(
+                    static_cast<uintptr_t>(hwnd_val));
             }
         } else if (arg == L"--pipe" && i + 1 < argc) {
             wcscpy_s(args.pipe_name, 256, argv[++i]);
         } else if (arg == L"--log" && i + 1 < argc) {
             wcscpy_s(args.log_path, 512, argv[++i]);
         } else if (arg == L"--fps" && i + 1 < argc) {
-            swscanf_s(argv[++i], L"%u", &args.target_fps);
+            // 支持小数帧率 (如 23.976); 0 表示跟随合成器刷新率
+            double fps = 0.0;
+            if (swscanf_s(argv[++i], L"%lf", &fps) == 1 && fps >= 0.0) {
+                if (fps > 1000.0) fps = 1000.0;
+                args.target_fps = fps;
+            }
         }
     }
 
@@ -313,7 +351,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     if (!args.mpv_hwnd || !IsWindow(args.mpv_hwnd)) {
         DANMAKU_LOG_FATAL(LOG_TAG, "无效的 mpv 窗口句柄, 退出");
-        CoUninitialize();
+        // ⚠ 此处尚未 CoInitializeEx, 不能配对 CoUninitialize
         return 1;
     }
 
@@ -328,9 +366,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     // DPI 感知 (Per-Monitor V2)
     danmaku_overlay::platform::SetDpiAwareness();
 
-    // 提升系统定时器分辨率到 1ms。
-    timeBeginPeriod(1);
-
     // 默认管道名 (基于 PID)
     wchar_t default_pipe[256];
     if (args.pipe_name[0] == 0) {
@@ -343,7 +378,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (args.mpv_pid) DANMAKU_LOG_INFO(LOG_TAG, "mpv PID: %u", args.mpv_pid);
     DANMAKU_LOG_INFO(LOG_TAG, "mpv 窗口句柄: 0x%p", args.mpv_hwnd);
     DANMAKU_LOG_INFO(LOG_TAG, "管道名: %ls", args.pipe_name);
-    DANMAKU_LOG_INFO(LOG_TAG, "目标帧率: %u", args.target_fps);
+    if (args.target_fps > 0.0)
+        DANMAKU_LOG_INFO(LOG_TAG, "目标帧率: %.3f Hz", args.target_fps);
+    else
+        DANMAKU_LOG_INFO(LOG_TAG, "目标帧率: 自动 (跟随合成器刷新率)");
 
     // 创建模块实例 + 依赖容器 (按引用注入, 取代全局裸指针)
     danmaku_overlay::WindowManager  window;
@@ -353,7 +391,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     danmaku_overlay::AppContext ctx;
     ctx.window = &window;
     ctx.engine = &engine;
-    ctx.ipc    = &ipc;
 
     // ---- 单实例防护: 每个 mpv 只允许 1 个 overlay 实例 ----
     // 必须在创建窗口/线程之前判定。lua 反复切形态或重载脚本会多次拉起本 exe,
@@ -367,7 +404,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             mpv_pid = static_cast<uint32_t>(pid);
         }
         if (!danmaku_overlay::acquire_single_instance(mpv_pid, args.pipe_name, &ctx)) {
-            timeEndPeriod(1);
             CoUninitialize();
             return 1;
         }
@@ -390,7 +426,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     config.target_fps = args.target_fps;
 
     // 步骤 1: 创建透明叠加窗口 (跟踪 mpv 窗口)
-    auto ec = window.create(hInstance, 1280, 720, true);
+    auto ec = window.create(hInstance, 1280, 720);
     if (ec != danmaku_overlay::ErrorCode::Ok) {
         DANMAKU_LOG_FATAL(LOG_TAG, "窗口创建失败: %s",
                           danmaku_overlay::error_string(ec));
@@ -412,7 +448,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (ctx.render_thread.joinable())
             ctx.render_thread.join();
         window.destroy();
-        timeEndPeriod(1);
         CoUninitialize();
         return 1;
     }
@@ -430,7 +465,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (ctx.render_thread.joinable())
             ctx.render_thread.join();
         window.destroy();
-        timeEndPeriod(1);
         CoUninitialize();
         return 1;
     }
@@ -439,15 +473,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     // 启动 IPC 监听线程
     ipc.start_listening();
 
+    // ---- mpv 窗口几何监听 (WinEvent): 移动/缩放时立即同步, 免去 1ms 轮询 ----
+    g_tracked_mpv_hwnd.store(args.mpv_hwnd, std::memory_order_relaxed);
+    HWINEVENTHOOK geom_hook = nullptr;
+    if (ctx.mpv_pid) {
+        geom_hook = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+            nullptr, mpv_geom_event_proc,
+            static_cast<DWORD>(ctx.mpv_pid), 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    DANMAKU_LOG_INFO(LOG_TAG, "窗口几何跟踪: %s",
+                     geom_hook ? "WinEvent 事件驱动" : "轮询 (无事件, 每轮同步)");
+
+    // 主循环节拍定时器 (高分辨率等待, 不依赖 timeBeginPeriod)
+    HANDLE loop_timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!loop_timer) {
+        DANMAKU_LOG_WARN(LOG_TAG, "主循环定时器创建失败, 退回 Sleep (较粗粒度)");
+    }
+
     // 进入主消息循环 (渲染已在渲染线程独立运行)
     DANMAKU_LOG_INFO(LOG_TAG, "进入主消息循环");
 
     // 主线程: 只处理窗口消息 + 位置/尺寸跟踪 + 退出检查。
-    // 渲染循环由渲染线程负责, 主线程空闲时 Sleep 避免忙等。
+    // 渲染循环由渲染线程负责, 主线程空闲时等待定时器避免忙等。
     MSG msg = {};
     uint32_t last_w = 0, last_h = 0;  // 跟踪窗口尺寸变化
     ULONGLONG lost_since = 0;         // mpv 窗口开始丢失的时刻 (0=未丢失)
     ULONGLONG next_probe = 0;         // 下次重新查找窗口的时刻
+    ULONGLONG next_geom_sync = 0;     // 下次兜底几何同步的时刻
     while (ctx.running.load(std::memory_order_acquire)) {
         // 处理窗口消息 (非阻塞)
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -485,6 +540,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                             "mpv 窗口已重建, 重新绑定: 0x%p -> 0x%p",
                             args.mpv_hwnd, new_hwnd);
                         args.mpv_hwnd = new_hwnd;
+                        g_tracked_mpv_hwnd.store(new_hwnd, std::memory_order_relaxed);
                         window.set_mpv_hwnd(new_hwnd);  // 同步 owner 并抬回 mpv 上方
                         lost_since = 0;
                         continue;
@@ -511,8 +567,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             break;
         }
 
-        // 同步 overlay 窗口位置到 mpv 窗口 (跟踪移动/缩放/跨屏 DPI 变化)
-        window.sync_to_mpv_window();
+        // 同步 overlay 窗口位置到 mpv 窗口 (跟踪移动/缩放/跨屏 DPI 变化)。
+        // 有 WinEvent 时按事件同步 (另加 250ms 兜底); 没有事件源时每轮同步。
+        const ULONGLONG t_geom = GetTickCount64();
+        const bool geom_dirty =
+            g_mpv_geom_dirty.exchange(false, std::memory_order_relaxed);
+        if (!geom_hook || geom_dirty || t_geom >= next_geom_sync) {
+            window.sync_to_mpv_window();
+            next_geom_sync = t_geom + 250;
+        }
 
         // 检测窗口尺寸变化 → 请求渲染线程重建 (不阻塞主线程)
         uint32_t cur_w = window.get_physical_width();
@@ -524,8 +587,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             last_h = cur_h;
         }
 
-        // 主线程空闲: 让出 CPU, 渲染节奏完全由渲染线程的 vsync 等待控制
-        Sleep(1);
+        // 主线程空闲: 让出 CPU, 渲染节奏完全由渲染线程的节拍等待控制
+        wait_main_loop(loop_timer, 8);
     }
 
     // 清理
@@ -557,7 +620,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     window.destroy();
 
-    timeEndPeriod(1);   // 还原系统定时器分辨率 (配对 timeBeginPeriod)
+    if (geom_hook) UnhookWinEvent(geom_hook);
+    if (loop_timer) CloseHandle(loop_timer);
+
     CoUninitialize();
     return static_cast<int>(msg.wParam);
 }

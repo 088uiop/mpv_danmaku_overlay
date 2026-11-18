@@ -51,8 +51,6 @@ public:
     ErrorCode initialize(IDWriteFactory* dwrite_factory,
                          ID2D1Factory* d2d_factory = nullptr);
 
-    void set_target(ID2D1RenderTarget* rt) { target_ = rt; }
-
     const GlyphEntry* get_or_create(const std::string& text,
                                     float font_size, bool bold,
                                     bool italic = false,
@@ -61,9 +59,6 @@ public:
     void evict_lru();           // 淘汰最久未用 (跳过本帧正在使用的条目)
     void clear();
 
-    size_t size() const { return cache_.size(); }
-    size_t capacity() const { return max_entries_; }
-    void set_capacity(size_t max_entries) { max_entries_ = max_entries; }
     void tick() { ++frame_counter_; }
 
     // 声明"该条目本帧仍在使用" (更新 LRU 位置, 免被淘汰), 仅供 64 位 key 查表
@@ -86,7 +81,6 @@ private:
 
     IDWriteFactory*                 dwrite_factory_ = nullptr;
     ID2D1Factory*                   d2d_factory_    = nullptr;
-    ID2D1RenderTarget*              target_         = nullptr;
 
     std::unordered_map<uint64_t, GlyphEntry> cache_;
     std::list<uint64_t>                     lru_list_;   // front=最久未用
@@ -116,18 +110,21 @@ public:
     // 加载 ASS 文件 (解析并构建 AssDocument)
     ErrorCode load_ass_file(const std::string& filepath);
 
-    void clear();
+    // 清空弹幕。返回 true 表示确实清掉了内容 (供 IPC 日志去重)
+    bool clear();
 
     // 时间同步 (只在关键事件调用, 不持续上报):
     //   sync/set_speed/set_paused 重设时钟基准; set_delay 运行时热调
     void sync(TimePos time_pos, double speed, bool paused);
     void set_speed(double speed);
     void set_paused(bool paused);
-    void set_delay(double seconds);
+    // 返回 true 表示延迟确实变化 (未变化时不做平移/重画, 供日志去重)
+    bool set_delay(double seconds);
 
     // 渲染一帧: 用内置 QPC 时钟推进弹幕时间 -> 画到合成器画布 -> 合成上屏
     bool render();   // 返回 true 表示本帧真的提交了绘制 (空闲可据此降频)
-    void wait_for_next_frame();
+    void wait_for_next_frame();   // 阻塞到下一帧的呈现时刻
+    void wait_idle(uint32_t ms);  // 空闲等待 (高分辨率定时器, 不抬高系统定时器精度)
 
     // 渲染开关 (关时跳过全部绘制/合成, 进程存活可即时恢复)
     void set_enabled(bool enabled);
@@ -139,7 +136,6 @@ public:
     void set_hdr_peak(float peak);
 
 uint32_t get_active_count() const;
-    RenderConfig get_config() const;
 
     // 前台满载播放器抢 GPU 时的自适应让出: 注册目标进程 (mpv 的 pid)。
     //   详见 LayeredPresenter::set_gpu_yield_pid 与 layered_presenter.cpp。
@@ -181,9 +177,11 @@ private:
     float               ass_alpha_        = 1.0f;   // 整层不透明度 (取自 ASS)
     bool                last_frame_empty_ = false;
 
-    LARGE_INTEGER       frame_qpc_{};
+    LARGE_INTEGER       frame_qpc_{};             // 下一次允许上屏的 QPC 截止时刻
     double              frame_interval_ = 1.0 / 60.0;
     HANDLE              frame_timer_ = nullptr;   // 高分辨率帧节拍定时器 (可空)
+    bool                timer_period_raised_ = false; // 定时器兜底: 是否已 timeBeginPeriod
+    bool                auto_pace_ = false;       // target_fps<=0: 每个合成 tick 提交一次
     bool                pace_compositor_ = true;  // 对齐 DWM 合成 tick (DANMAKU_PACING=timer 关闭)
     uint32_t            pace_fail_streak_ = 0;    // 连续等 tick 失败次数, 超限退回定时器
 

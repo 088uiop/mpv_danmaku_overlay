@@ -19,10 +19,7 @@ public:
     WindowManager();
     ~WindowManager();
 
-    ErrorCode create(HINSTANCE hInstance, uint32_t width,
-                     uint32_t height, bool borderless);
-
-    DpiInfo get_dpi() const;
+    ErrorCode create(HINSTANCE hInstance, uint32_t width, uint32_t height);
 
     HWND get_hwnd() const { return hwnd_; }
 
@@ -96,6 +93,12 @@ public:
     bool valid() const;
     ErrorCode recreate_target();
 
+    // ── 设备丢失 (驱动重置 / TDR) ──
+    // present / begin_frame 检测到 DXGI_ERROR_DEVICE_REMOVED|RESET 时置位;
+    // 引擎在渲染线程调用 recover_device() 重建全部 D3D/D2D/DComp 资源。
+    bool device_lost() const { return device_lost_; }
+    ErrorCode recover_device();
+
 // 每帧流程: begin_frame → (引擎绘制) → end_frame → present(alpha)
 HRESULT begin_frame();
     HRESULT end_frame();
@@ -165,7 +168,6 @@ HRESULT begin_frame();
 
     uint32_t width() const { return phys_width_; }
     uint32_t height() const { return phys_height_; }
-    DpiInfo dpi() const { return dpi_; }
 
 private:
     ErrorCode init_d3d11();
@@ -217,6 +219,8 @@ private:
 
     // 整层透明度 (ass_alpha * config.opacity), 由 present() 写入
     float global_alpha_ = 1.0f;
+
+    bool  device_lost_ = false;   // 设备丢失待重建 (见 recover_device)
 
     // HDR 渲染模式
     bool  hdr_active_ = false;

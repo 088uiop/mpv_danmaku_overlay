@@ -253,7 +253,7 @@ bool WindowManager::register_window_class() {
 // ============================================================
 
 ErrorCode WindowManager::create(HINSTANCE hInstance, uint32_t width,
-                                 uint32_t height, bool /*borderless*/) {
+                                 uint32_t height) {
     hinstance_ = hInstance;
 
     if (!register_window_class()) {
@@ -265,7 +265,6 @@ ErrorCode WindowManager::create(HINSTANCE hInstance, uint32_t width,
         dpi_ = platform::GetWindowDpi(mpv_hwnd_);
     } else {
         dpi_.dpi_x = dpi_.dpi_y = 96;
-        dpi_.update();
     }
 
     // 物理尺寸
@@ -355,15 +354,6 @@ hwnd_ = CreateWindowExW(
                      "幽灵窗口已创建: hwnd=0x%p ex_style=TRANSPARENT|TOOLWINDOW|NOREDIRECTIONBITMAP",
                      hwnd_);
     return ErrorCode::Ok;
-}
-
-// ============================================================
-// DPI 获取
-// ============================================================
-
-DpiInfo WindowManager::get_dpi() const {
-    if (hwnd_) return platform::GetWindowDpi(hwnd_);
-    return dpi_;
 }
 
 // ============================================================
@@ -1255,6 +1245,40 @@ ErrorCode LayeredPresenter::recreate_target() {
 }
 
 // ============================================================
+// recover_device - 设备丢失后的完整重建 (驱动重置 / TDR)
+// ============================================================
+// 只在渲染线程调用。调用方还需重建依赖旧设备的文本布局缓存。
+ErrorCode LayeredPresenter::recover_device() {
+    const HWND     hwnd      = hwnd_;
+    const uint32_t w         = phys_width_;
+    const uint32_t h         = phys_height_;
+    const DpiInfo  dpi       = dpi_;
+    const uint32_t yield_pid = gpu_yield_pid_;
+    const bool     want_hdr  =
+        hdr_active_ || hdr_enabled_requested_.load(std::memory_order_relaxed);
+
+    DANMAKU_LOG_WARN(LOG_TAG, "重建图形资源 (设备丢失恢复)...");
+    shutdown();
+    device_lost_ = false;
+
+    ErrorCode ec = initialize(hwnd, w, h, dpi);
+    if (ec != ErrorCode::Ok) {
+        DANMAKU_LOG_ERROR(LOG_TAG, "设备重建失败 (ec=%d)", static_cast<int>(ec));
+        return ec;
+    }
+
+    gpu_yield_pid_ = yield_pid;   // shutdown 会清空让出目标, 这里恢复
+
+    // 恢复 HDR 意图: 下一次 render() 的 process_pending_hdr 会按新设备重建
+    if (want_hdr) {
+        hdr_enabled_requested_.store(true, std::memory_order_relaxed);
+        hdr_enabled_pending_.store(true, std::memory_order_release);
+    }
+    DANMAKU_LOG_INFO(LOG_TAG, "图形资源重建完成");
+    return ErrorCode::Ok;
+}
+
+// ============================================================
 // resize - 尺寸变更 (ResizeBuffers 重建 swap chain)
 // ============================================================
 
@@ -1308,7 +1332,14 @@ HRESULT LayeredPresenter::begin_frame() {
     HRESULT hr = swap_chain_->GetBuffer(
         0, __uuidof(ID3D11Texture2D),
         reinterpret_cast<void**>(back_buffer_.GetAddressOf()));
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) {
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            device_lost_ = true;
+            DANMAKU_LOG_ERROR(LOG_TAG, "GetBuffer 检测到设备丢失 (HR=0x%08X)",
+                              static_cast<unsigned int>(hr));
+        }
+        return hr;
+    }
 
     // ---------------- HDR: 离屏合成路径 ----------------
     // back buffer 用 D3D11 直接清 (这一帧没有任何 D2D 绘制落在它上面,
@@ -1366,10 +1397,6 @@ HRESULT LayeredPresenter::end_frame() {
     if (!d2d_context_) return E_FAIL;
     return d2d_context_->EndDraw();
 }
-
-// ============================================================
-// present - 提交帧: 释放引用 → 施加透明度 → Present → Commit
-// ============================================================
 
 // ============================================================
 // GPU 调度优先级让出
@@ -1544,9 +1571,6 @@ void LayeredPresenter::gpu_yield_note_dwm_interval(double ms) {
 void LayeredPresenter::observe_dwm_frame() {
     if (!dcomp_device_) return;
 
-    static LONGLONG s_qpc_freq = []{
-        LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
-
     DCOMPOSITION_FRAME_STATISTICS fs = {};
     if (FAILED(dcomp_device_->GetFrameStatistics(&fs))) return;
     if (fs.timeFrequency.QuadPart <= 0) return;
@@ -1571,7 +1595,6 @@ void LayeredPresenter::observe_dwm_frame() {
         }
         comp_last_frame_ = t;
     }
-    (void)s_qpc_freq;
 }
 
 bool LayeredPresenter::wait_compositor_tick(DWORD timeout_ms) {
@@ -1680,6 +1703,18 @@ void LayeredPresenter::present(float global_alpha) {
     QueryPerformanceCounter(&t1);
     gpu_yield_tick(true, static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0
                         / static_cast<double>(s_freq.QuadPart));
+
+    // 设备丢失: 置位交给引擎在下一帧重建 (此处只做检测/记录, 不原地重建,
+    // 避免在 present 路径里做重量级资源创建)。
+    if (phr == DXGI_ERROR_DEVICE_REMOVED || phr == DXGI_ERROR_DEVICE_RESET) {
+        if (!device_lost_) {
+            DANMAKU_LOG_ERROR(LOG_TAG,
+                "Present 检测到设备丢失 (HR=0x%08X), 稍后重建图形资源",
+                static_cast<unsigned int>(phr));
+        }
+        device_lost_ = true;
+    }
+
     if (diag_active()) {
         ++diag_presents_;
         diag_present_hr_last_ = static_cast<unsigned>(phr);

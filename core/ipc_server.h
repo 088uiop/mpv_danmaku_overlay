@@ -38,19 +38,12 @@ enum class IpcMessageType : uint8_t {
 struct IpcMessage {
     IpcMessageType type = IpcMessageType::Ping;
     std::string    json_payload;
-    IpcMessage() = default;
-    IpcMessage(IpcMessageType t, std::string payload)
-        : type(t), json_payload(std::move(payload)) {}
 };
 
 struct IpcPlayState {
     double   time_pos   = 0.0;
-    double   duration   = 0.0;
-    bool     paused     = false;
     double   speed      = 1.0;
-    bool     seeking    = false;
-    uint32_t osd_width  = 0;
-    uint32_t osd_height = 0;
+    bool     paused     = false;
 };
 
 class IpcServer {
@@ -98,6 +91,10 @@ private:
     // ConnectNamedPipe 上的同步等待, 否则 mpv 消失路径下 (lua 客户端已死,
     // 无人来连接) 监听线程将永久阻塞, listen_thread_.join() 卡死。
     std::atomic<DWORD>  listen_thread_id_{0};
+
+    // 读取线程的 Win32 线程 ID: 读线程阻塞在 ReadFile 上,
+    // shutdown() 同样需要 CancelSynchronousIo 才能让它及时退出。
+    std::atomic<DWORD>  read_thread_id_{0};
 
     std::thread         listen_thread_;
     std::thread         read_thread_;

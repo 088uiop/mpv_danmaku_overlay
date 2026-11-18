@@ -228,6 +228,7 @@ void IpcServer::shutdown() {
     bool listen_done = !listen_thread_.joinable();
     if (!listen_done) {
         HANDLE th = nullptr;
+        HANDLE rth = nullptr;
         const ULONGLONG deadline = GetTickCount64() + 2000;
         while (GetTickCount64() < deadline) {
             if (!th) {
@@ -235,11 +236,23 @@ void IpcServer::shutdown() {
                 if (tid != 0)
                     th = OpenThread(SYNCHRONIZE | THREAD_TERMINATE, FALSE, tid);
             }
-            if (th && WaitForSingleObject(th, 0) == WAIT_OBJECT_0) {
+            if (!rth) {
+                DWORD tid = read_thread_id_.load(std::memory_order_acquire);
+                if (tid != 0)
+                    rth = OpenThread(SYNCHRONIZE | THREAD_TERMINATE, FALSE, tid);
+            }
+
+            // 监听线程与读线程都退出才算真正收尾 (读线程可能阻塞在 ReadFile)
+            const bool listen_exited =
+                th && WaitForSingleObject(th, 0) == WAIT_OBJECT_0;
+            const bool read_exited =
+                read_thread_id_.load(std::memory_order_acquire) == 0;
+            if (listen_exited && read_exited) {
                 listen_done = true;
                 break;
             }
             if (th) CancelSynchronousIo(th);
+            if (rth) CancelSynchronousIo(rth);   // 唤醒阻塞在 ReadFile 上的读线程
 
             HANDLE c = CreateFileW(pipe_name_, GENERIC_READ | GENERIC_WRITE, 0,
                                    nullptr, OPEN_EXISTING, 0, nullptr);
@@ -247,6 +260,7 @@ void IpcServer::shutdown() {
             Sleep(5);
         }
         if (th) CloseHandle(th);
+        if (rth) CloseHandle(rth);
     }
 
     // 管道句柄的创建与关闭完全由监听线程管理 (谁创建谁关闭),
@@ -334,33 +348,23 @@ void IpcServer::listen_thread_main() {
 void IpcServer::read_thread_main() {
     char buffer[8192];
     recv_buffer_.clear();
+    read_thread_id_.store(GetCurrentThreadId(), std::memory_order_release);
 
     DANMAKU_LOG_INFO(LOG_TAG, "IPC 读取线程启动");
 
+    // 阻塞读: 数据到达 / 管道断开 / 被 CancelSynchronousIo 取消时才返回。
+    // (旧实现是 PeekNamedPipe + Sleep(1) 轮询, 连接期间每秒空转上千次。)
     while (running_.load(std::memory_order_acquire)
            && client_connected_.load(std::memory_order_acquire)) {
-        DWORD bytes_available = 0;
-        if (!PeekNamedPipe(pipe_handle_, nullptr, 0, nullptr,
-                           &bytes_available, nullptr)) {
-            DANMAKU_LOG_INFO(LOG_TAG, "管道断开 (PeekNamedPipe)");
-            break;
-        }
-
-        if (bytes_available == 0) {
-            Sleep(1);
-            continue;
-        }
-
         DWORD bytes_read = 0;
-        BOOL ok = ReadFile(pipe_handle_, buffer,
-                           (bytes_available < sizeof(buffer))
-                               ? bytes_available : sizeof(buffer),
+        BOOL ok = ReadFile(pipe_handle_, buffer, sizeof(buffer),
                            &bytes_read, nullptr);
         if (!ok || bytes_read == 0) {
-            DANMAKU_LOG_INFO(LOG_TAG, "管道读取失败 (GLE=%lu)", GetLastError());
+            if (running_.load(std::memory_order_acquire)) {
+                DANMAKU_LOG_INFO(LOG_TAG, "管道读取结束 (GLE=%lu)", GetLastError());
+            }
             break;
         }
-
 
         recv_buffer_.append(buffer, bytes_read);
 
@@ -381,6 +385,9 @@ void IpcServer::read_thread_main() {
 
         if (pos > 0) recv_buffer_.erase(0, pos);
     }
+
+    read_thread_id_.store(0, std::memory_order_release);
+    DANMAKU_LOG_INFO(LOG_TAG, "IPC 读取线程退出");
 }
 
 IpcMessage IpcServer::parse_json_message(const std::string& line) {
@@ -484,8 +491,8 @@ void IpcServer::handle_message(const IpcMessage& msg) {
         break;
 
     case IpcMessageType::ClearDanmaku:
-        if (engine_) {
-            engine_->clear();
+        // 只在确实清掉了内容时记录, lua 重复下发 clear 不再刷屏
+        if (engine_ && engine_->clear()) {
             DANMAKU_LOG_INFO(LOG_TAG, "弹幕已清空");
         }
         break;
@@ -507,13 +514,9 @@ std::string IpcServer::parse_ass_filepath(const std::string& json) {
 
 IpcPlayState IpcServer::parse_play_state(const std::string& json) {
     IpcPlayState s;
-    s.time_pos   = json::get_number(json.c_str(), "time_pos");
-    s.duration   = json::get_number(json.c_str(), "duration");
-    s.paused      = json::get_bool(json.c_str(), "paused");
-    s.speed       = json::get_number(json.c_str(), "speed");
-    s.seeking     = json::get_bool(json.c_str(), "seeking");
-    s.osd_width   = static_cast<uint32_t>(json::get_int(json.c_str(), "osd_width"));
-    s.osd_height  = static_cast<uint32_t>(json::get_int(json.c_str(), "osd_height"));
+    s.time_pos = json::get_number(json.c_str(), "time_pos");
+    s.paused   = json::get_bool(json.c_str(), "paused");
+    s.speed    = json::get_number(json.c_str(), "speed");
     return s;
 }
 
@@ -543,8 +546,9 @@ void IpcServer::parse_delay_config(const std::string& json) {
     double delay = json::get_number(json.c_str(), "delay");
     if (delay > 120.0) delay = 120.0;
     if (delay < -120.0) delay = -120.0;
-    engine_->set_delay(delay);
-    DANMAKU_LOG_INFO(LOG_TAG, "延迟调整: %.3f 秒", delay);
+    if (engine_->set_delay(delay)) {
+        DANMAKU_LOG_INFO(LOG_TAG, "延迟调整: %.3f 秒", delay);
+    }
 }
 
 void IpcServer::parse_hdr_config(const std::string& json) {
